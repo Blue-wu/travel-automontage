@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/trend_report.schema.json",
+  "title": "TrendReport",
+  "description": "抖音旅行赛道趋势分析报告 — 喂给剧本生成的'弹药库'",
+  "type": "object",
+  "required": ["niche", "analyzed_at", "hot_topics", "viral_patterns", "hook_formulas"],
+  "properties": {
+    "niche": { "type": "string", "description": "赛道，如 '旅行'" },
+    "destination": { "type": "string", "description": "目的地过滤（可选）" },
+    "analyzed_at": { "type": "string", "format": "date-time" },
+    "hot_topics": {
+      "type": "array",
+      "description": "热门话题 / 关键词",
+      "items": {
+        "type": "object",
+        "required": ["keyword", "search_volume", "growth_rate"],
+        "properties": {
+          "keyword": { "type": "string" },
+          "search_volume": { "type": "integer" },
+          "content_volume": { "type": "integer" },
+          "growth_rate": { "type": "number", "description": "周环比增长率" }
+        }
+      }
+    },
+    "viral_patterns": {
+      "type": "array",
+      "description": "爆款规律提炼",
+      "items": {
+        "type": "object",
+        "required": ["pattern_name", "description", "frequency"],
+        "properties": {
+          "pattern_name": { "type": "string" },
+          "description": { "type": "string" },
+          "frequency": { "type": "number", "description": "在采样视频中出现的比例 0-1" },
+          "example_videos": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "hook_formulas": {
+      "type": "array",
+      "description": "开头钩子公式",
+      "items": {
+        "type": "object",
+        "required": ["hook_type", "template", "effectiveness"],
+        "properties": {
+          "hook_type": {
+            "type": "string",
+            "enum": ["suspense", "contrast", "resonance", "number", "question", "shock"]
+          },
+          "template": { "type": "string", "description": "钩子模板，如 '去了X次Y才知道...'" },
+          "effectiveness": { "type": "number", "description": "平均完播率 0-1" },
+          "example_text": { "type": "string" }
+        }
+      }
+    },
+    "pacing_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rule": { "type": "string" },
+          "avg_shot_duration": { "type": "number" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "music_trends": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "bgm_name": { "type": "string" },
+          "usage_count": { "type": "integer" },
+          "mood": { "type": "string" }
+        }
+      }
+    }
+  }
+}

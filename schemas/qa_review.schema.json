@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/qa_review.schema.json",
+  "title": "QAReview",
+  "description": "质量自检报告 — 所有 gate 必须通过才能输出",
+  "type": "object",
+  "required": ["video_path", "passed", "checks"],
+  "properties": {
+    "video_path": { "type": "string" },
+    "reviewed_at": { "type": "string", "format": "date-time" },
+    "passed": { "type": "boolean", "description": "是否通过所有检查" },
+    "overall_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "passed", "score"],
+        "properties": {
+          "name": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "message": { "type": "string" },
+          "details": { "type": "object" }
+        }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "description": "未通过的检查项列表",
+      "items": { "type": "string" }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

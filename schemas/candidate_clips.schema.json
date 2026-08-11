@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/candidate_clips.schema.json",
+  "title": "CandidateClips",
+  "description": "语义检索输出的候选素材片段",
+  "type": "object",
+  "required": ["query", "destination", "clips"],
+  "properties": {
+    "query": { "type": "string", "description": "检索查询语句" },
+    "destination": { "type": "string" },
+    "total_found": { "type": "integer" },
+    "clips": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["asset_id", "source_path", "start_sec", "end_sec", "score"],
+        "properties": {
+          "asset_id": { "type": "string" },
+          "source_path": { "type": "string" },
+          "start_sec": { "type": "number" },
+          "end_sec": { "type": "number" },
+          "score": { "type": "number", "description": "语义相似度 0-1" },
+          "scene_summary": { "type": "string" },
+          "visual_tags": { "type": "array", "items": { "type": "string" } },
+          "quality": { "type": "number" }
+        }
+      }
+    }
+  }
+}

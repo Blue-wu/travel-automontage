@@ -1,0 +1,117 @@
+# travel-vlog.yaml
+# 单目的地叙事 Vlog — 最核心的流水线
+# Agent 读取此文件，按 stages 顺序调用 tool，用 skill 做品质基准
+
+pipeline:
+  name: travel-vlog
+  description: "单目的地旅行叙事 Vlog，30-60秒，适配抖音竖屏"
+  version: "1.0"
+
+  # 全局变量，可被 stages 中的 {{var}} 引用
+  variables:
+    destination: "日本-富士山"
+    duration: 30
+    aspect_ratio: "9:16"
+    resolution: "1080x1920"
+    fps: 30
+
+  stages:
+    # ── Stage 1: 趋势研究 ──
+    # 分析抖音旅行赛道当前趋势，输出 trend_report.json
+    - name: trend_research
+      tool: tools.trends.douyin_trend_analyzer.DouyinTrendAnalyzer.analyze_travel_trends
+      skill: skills/douyin-travel-format.md
+      input:
+        niche: "旅行"
+        destination: "{{destination}}"
+      output: trend_report.json
+      output_schema: schemas/trend_report.schema.json
+      on_failure: "warn"  # 趋势分析失败不阻塞，用默认 hooks
+
+    # ── Stage 2: 素材检索 ──
+    # 从自有素材库中语义检索匹配的候选片段
+    - name: asset_retrieval
+      tool: tools.retrieve.semantic_asset_retriever.SemanticAssetRetriever.retrieve
+      input:
+        query: "{{trend_report.hook_formulas[0].template}} {{destination}}"
+        destination: "{{destination}}"
+        top_k: 20
+      output: candidate_clips.json
+      output_schema: schemas/candidate_clips.schema.json
+      depends_on: [trend_research]
+      on_failure: "fatal"
+
+    # ── Stage 3: 剧本生成 ──
+    # 结合趋势 + 素材，生成创意剧本
+    - name: script_generation
+      tool: tools.edit.script_generator.ScriptGenerator.generate
+      skill: skills/travel-storytelling.md
+      input:
+        trend: "{{trend_report}}"
+        clips: "{{candidate_clips}}"
+        destination: "{{destination}}"
+        duration: "{{duration}}"
+      output: script.json
+      output_schema: schemas/script.schema.json
+      depends_on: [trend_research, asset_retrieval]
+      on_failure: "fatal"
+
+    # ── Stage 4: 分镜规划 ──
+    # 将剧本拆解为分镜表，匹配具体素材
+    - name: storyboard
+      tool: tools.edit.storyboard_planner.StoryboardPlanner.plan
+      skill: skills/travel-pacing.md
+      input:
+        script: "{{script}}"
+        candidate_clips: "{{candidate_clips}}"
+      output: storyboard.json
+      depends_on: [script_generation]
+      on_failure: "fatal"
+
+    # ── Stage 5: 剪辑决策 ──
+    # 生最终剪辑指令：入点出点、转场、字幕、特效
+    - name: edit_decision
+      tool: tools.edit.edit_decision_maker.EditDecisionMaker.decide
+      skill: skills/travel-pacing.md
+      input:
+        storyboard: "{{storyboard}}"
+        output_format:
+          width: 1080
+          height: 1920
+          fps: 30
+      output: edit_decision.json
+      output_schema: schemas/edit_decision.schema.json
+      depends_on: [storyboard]
+      on_failure: "fatal"
+
+    # ── Stage 6: 渲染合成 ──
+    - name: compose
+      tool: tools.compose.ffmpeg_composer.FFmpegComposer.compose
+      skill: agents_skills/ffmpeg.md
+      input:
+        edit_decision: "{{edit_decision}}"
+        output_path: "data/output/final_{{destination}}.mp4"
+      output: final_video.mp4
+      depends_on: [edit_decision]
+      on_failure: "fatal"
+
+    # ── Stage 7: 质量自检 ──
+    - name: qa
+      tool: tools.qa.quality_reviewer.QualityReviewer.review
+      skill: skills/douyin-travel-format.md
+      input:
+        video_path: "{{final_video}}"
+        edit_decision: "{{edit_decision}}"
+      output: qa_review.json
+      output_schema: schemas/qa_review.schema.json
+      gates:
+        - slideshow_risk_check    # 防止"假视频"（静态图片轮播）
+        - audio_level_check        # 音频电平合规
+        - subtitle_presence_check  # 必须有字幕
+        - douyin_format_check       # 9:16, 1080p, ≤60s
+        - pacing_curve_check        # 动静节奏曲线
+      on_failure: "retry"  # QA 不通过则回到 edit_decision 重做
+      retry:
+        max_attempts: 2
+        back_to: edit_decision
+      depends_on: [compose]

@@ -1,0 +1,123 @@
+# travel-shorts.yaml
+# 旅行短视频 / Reels — 极短时长（15-20秒），高信息密度，强钩子
+# 适合：单景点种草、旅行技巧、美食探店
+
+pipeline:
+  name: travel-shorts
+  description: "旅行短视频，15-20秒，高密度快剪，强钩子开头"
+  version: "1.0"
+
+  variables:
+    destination: "日本-东京"
+    duration: 15
+    aspect_ratio: "9:16"
+    resolution: "1080x1920"
+    fps: 30
+    style: "fast_cut"  # fast_cut | cinematic | vlog
+
+  stages:
+    # ── Stage 1: 趋势研究 ──
+    # 短视频更依赖热点，趋势分析权重更高
+    - name: trend_research
+      tool: tools.trends.douyin_trend_analyzer.DouyinTrendAnalyzer.analyze_travel_trends
+      skill: skills/douyin-travel-format.md
+      input:
+        niche: "旅行短视频"
+        destination: "{{destination}}"
+        focus: "hooks"  # 重点关注钩子公式
+      output: trend_report.json
+      output_schema: schemas/trend_report.schema.json
+      on_failure: "warn"
+
+    # ── Stage 2: 素材检索 ──
+    - name: asset_retrieval
+      tool: tools.retrieve.semantic_asset_retriever.SemanticAssetRetriever.retrieve
+      input:
+        query: "{{destination}} 冲击力 开头"
+        destination: "{{destination}}"
+        top_k: 10
+        min_quality: 0.8  # 短视频只取高质量素材
+      output: candidate_clips.json
+      output_schema: schemas/candidate_clips.schema.json
+      depends_on: [trend_research]
+      on_failure: "fatal"
+
+    # ── Stage 3: 钩子优先剧本 ──
+    # 短视频逻辑：先定钩子，再填内容
+    - name: script_generation
+      tool: tools.edit.script_generator.ScriptGenerator.generate_short
+      skill: skills/travel-storytelling.md
+      input:
+        trend: "{{trend_report}}"
+        clips: "{{candidate_clips}}"
+        destination: "{{destination}}"
+        duration: "{{duration}}"
+        style: "{{style}}"
+      output: script.json
+      output_schema: schemas/script.schema.json
+      depends_on: [trend_research, asset_retrieval]
+      on_failure: "fatal"
+
+    # ── Stage 4: 快剪分镜 ──
+    - name: storyboard
+      tool: tools.edit.storyboard_planner.StoryboardPlanner.plan_fast_cut
+      skill: skills/travel-pacing.md
+      input:
+        script: "{{script}}"
+        candidate_clips: "{{candidate_clips}}"
+        avg_shot_duration: 1.5  # 短视频平均镜头时长 1-2 秒
+      output: storyboard.json
+      depends_on: [script_generation]
+      on_failure: "fatal"
+
+    # ── Stage 5: 剪辑决策 ──
+    - name: edit_decision
+      tool: tools.edit.edit_decision_maker.EditDecisionMaker.decide
+      input:
+        storyboard: "{{storyboard}}"
+        output_format:
+          width: 1080
+          height: 1920
+          fps: 30
+        subtitle_style:
+          font_size: 48
+          position: "center"
+          color: "#FFFFFF"
+          stroke: "#000000"
+      output: edit_decision.json
+      output_schema: schemas/edit_decision.schema.json
+      depends_on: [storyboard]
+      on_failure: "fatal"
+
+    # ── Stage 6: 渲染合成 ──
+    - name: compose
+      tool: tools.compose.ffmpeg_composer.FFmpegComposer.compose
+      input:
+        edit_decision: "{{edit_decision}}"
+        output_path: "data/output/shorts_{{destination}}_{{timestamp}}.mp4"
+      output: final_video.mp4
+      depends_on: [edit_decision]
+      on_failure: "fatal"
+
+    # ── Stage 7: 质量自检 ──
+    - name: qa
+      tool: tools.qa.quality_reviewer.QualityReviewer.review
+      skill: skills/douyin-travel-format.md
+      input:
+        video_path: "{{final_video}}"
+        edit_decision: "{{edit_decision}}"
+      output: qa_review.json
+      output_schema: schemas/qa_review.schema.json
+      gates:
+        - slideshow_risk_check
+        - audio_level_check
+        - subtitle_presence_check
+        - douyin_format_check       # 9:16, 1080p, ≤20s for shorts
+        - hook_strength_check        # 短视频专属：开头3秒钩子强度
+        - pacing_curve_check
+        - information_density_check  # 短视频专属：信息密度
+      on_failure: "retry"
+      retry:
+        max_attempts: 3
+        back_to: script_generation
+      depends_on: [compose]

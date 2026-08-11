@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/script.schema.json",
+  "title": "Script",
+  "description": "剧本 — 结合趋势分析 + 素材库生成的创意剧本",
+  "type": "object",
+  "required": ["title", "duration", "hook", "scenes"],
+  "properties": {
+    "title": { "type": "string" },
+    "destination": { "type": "string" },
+    "duration": { "type": "number", "description": "目标时长（秒）" },
+    "hook": {
+      "type": "object",
+      "required": ["type", "text"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["suspense", "contrast", "resonance", "number", "question", "shock"]
+        },
+        "text": { "type": "string" },
+        "duration_sec": { "type": "number" }
+      }
+    },
+    "bgm_suggestion": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "mood": { "type": "string" },
+        "bpm": { "type": "integer" }
+      }
+    },
+    "voiceover": {
+      "type": "string",
+      "description": "旁白全文"
+    },
+    "scenes": {
+      "type": "array",
+      "description": "分镜列表",
+      "items": {
+        "type": "object",
+        "required": ["order", "duration_sec", "clip_description", "narration"],
+        "properties": {
+          "order": { "type": "integer" },
+          "duration_sec": { "type": "number" },
+          "clip_description": { "type": "string", "description": "期望的画面描述" },
+          "narration": { "type": "string", "description": "此段的旁白文字" },
+          "subtitle": { "type": "string", "description": "字幕文字" },
+          "transition": {
+            "type": "string",
+            "enum": ["cut", "fade", "dissolve", "slide", "zoom", "wipe"]
+          },
+          "mood": { "type": "string" }
+        }
+      }
+    },
+    "cta": { "type": "string", "description": "结尾行动号召" }
+  }
+}

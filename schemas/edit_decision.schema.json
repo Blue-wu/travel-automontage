@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/edit_decision.schema.json",
+  "title": "EditDecision",
+  "description": "剪辑决策 — 将剧本映射到具体素材片段的编辑指令",
+  "type": "object",
+  "required": ["timeline", "output_format"],
+  "properties": {
+    "timeline": {
+      "type": "array",
+      "description": "时间线上的片段序列",
+      "items": {
+        "type": "object",
+        "required": ["order", "asset_id", "source_path", "in_sec", "out_sec", "duration_sec"],
+        "properties": {
+          "order": { "type": "integer" },
+          "asset_id": { "type": "string" },
+          "source_path": { "type": "string" },
+          "in_sec": { "type": "number", "description": "素材入点（秒）" },
+          "out_sec": { "type": "number", "description": "素材出点（秒）" },
+          "duration_sec": { "type": "number" },
+          "transition_in": {
+            "type": "string",
+            "enum": ["cut", "fade", "dissolve", "slide", "zoom", "wipe"]
+          },
+          "transition_duration": { "type": "number" },
+          "subtitle": { "type": "string" },
+          "subtitle_style": {
+            "type": "object",
+            "properties": {
+              "font_size": { "type": "integer" },
+              "position": { "type": "string", "enum": ["top", "center", "bottom"] },
+              "color": { "type": "string" }
+            }
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "type": "string", "enum": ["zoom_in", "zoom_out", "ken_burns", "shake", "vignette"] },
+                "intensity": { "type": "number" }
+              }
+            }
+          },
+          "narration_text": { "type": "string" }
+        }
+      }
+    },
+    "bgm": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "volume": { "type": "number", "description": "0-1 音量比例" },
+        "fade_in_sec": { "type": "number" },
+        "fade_out_sec": { "type": "number" }
+      }
+    },
+    "voiceover": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "volume": { "type": "number" }
+      }
+    },
+    "output_format": {
+      "type": "object",
+      "required": ["width", "height", "fps"],
+      "properties": {
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "fps": { "type": "number" },
+        "codec": { "type": "string", "default": "h264" },
+        "preset": { "type": "string", "default": "medium" }
+      }
+    },
+    "total_duration_sec": { "type": "number" }
+  }
+}

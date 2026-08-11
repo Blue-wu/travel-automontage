@@ -1,0 +1,110 @@
+# travel-montage.yaml
+# 多素材混剪 — 无旁白叙事，纯画面+音乐驱动的旅行混剪
+# 适合：多目的地集锦、年度旅行回顾、BGM 驱动的节奏混剪
+
+pipeline:
+  name: travel-montage
+  description: "多素材旅行混剪，BGM 驱动节奏，无旁白"
+  version: "1.0"
+
+  variables:
+    destinations: ["日本-东京", "日本-京都", "日本-大阪"]
+    duration: 45
+    aspect_ratio: "9:16"
+    resolution: "1080x1920"
+    fps: 30
+    bgm_mood: "energetic"  # energetic | chill | epic | emotional
+
+  stages:
+    # ── Stage 1: 趋势研究（同 vlog，但关注混剪趋势）──
+    - name: trend_research
+      tool: tools.trends.douyin_trend_analyzer.DouyinTrendAnalyzer.analyze_travel_trends
+      input:
+        niche: "旅行混剪"
+        destination: null  # 多目的地，不做单点过滤
+      output: trend_report.json
+      output_schema: schemas/trend_report.schema.json
+      on_failure: "warn"
+
+    # ── Stage 2: BGM 选择 ──
+    # 混剪的灵魂是音乐，先选 BGM 再按节奏切画面
+    - name: bgm_selection
+      tool: tools.edit.bgm_selector.BGMSelector.select
+      input:
+        mood: "{{bgm_mood}}"
+        trend_music: "{{trend_report.music_trends}}"
+        duration: "{{duration}}"
+      output: bgm_selection.json
+      depends_on: [trend_research]
+      on_failure: "warn"
+
+    # ── Stage 3: 多目的地素材检索 ──
+    - name: asset_retrieval
+      tool: tools.retrieve.semantic_asset_retriever.SemanticAssetRetriever.retrieve_multi
+      input:
+        destinations: "{{destinations}}"
+        mood: "{{bgm_mood}}"
+        top_k_per_destination: 8
+      output: candidate_clips.json
+      output_schema: schemas/candidate_clips.schema.json
+      on_failure: "fatal"
+
+    # ── Stage 4: 节拍对齐分镜 ──
+    # 将素材片段对齐到 BGM 节拍点
+    - name: beat_aligned_storyboard
+      tool: tools.edit.storyboard_planner.StoryboardPlanner.plan_beat_aligned
+      skill: skills/travel-pacing.md
+      input:
+        candidate_clips: "{{candidate_clips}}"
+        bgm: "{{bgm_selection}}"
+        duration: "{{duration}}"
+        bpm: "{{bgm_selection.bpm}}"
+      output: storyboard.json
+      depends_on: [bgm_selection, asset_retrieval]
+      on_failure: "fatal"
+
+    # ── Stage 5: 剪辑决策 ──
+    - name: edit_decision
+      tool: tools.edit.edit_decision_maker.EditDecisionMaker.decide
+      input:
+        storyboard: "{{storyboard}}"
+        bgm: "{{bgm_selection}}"
+        output_format:
+          width: 1080
+          height: 1920
+          fps: 30
+      output: edit_decision.json
+      output_schema: schemas/edit_decision.schema.json
+      depends_on: [beat_aligned_storyboard]
+      on_failure: "fatal"
+
+    # ── Stage 6: 渲染合成 ──
+    - name: compose
+      tool: tools.compose.ffmpeg_composer.FFmpegComposer.compose
+      input:
+        edit_decision: "{{edit_decision}}"
+        output_path: "data/output/montage_{{timestamp}}.mp4"
+      output: final_video.mp4
+      depends_on: [edit_decision]
+      on_failure: "fatal"
+
+    # ── Stage 7: 质量自检 ──
+    - name: qa
+      tool: tools.qa.quality_reviewer.QualityReviewer.review
+      skill: skills/douyin-travel-format.md
+      input:
+        video_path: "{{final_video}}"
+        edit_decision: "{{edit_decision}}"
+      output: qa_review.json
+      output_schema: schemas/qa_review.schema.json
+      gates:
+        - slideshow_risk_check
+        - audio_level_check
+        - beat_sync_check          # 混剪专属：画面是否卡在节拍点
+        - douyin_format_check
+        - pacing_curve_check
+      on_failure: "retry"
+      retry:
+        max_attempts: 2
+        back_to: edit_decision
+      depends_on: [compose]

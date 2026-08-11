@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/asset.schema.json",
+  "title": "Asset",
+  "description": "入库后的单个素材资产，包含场景分析和向量化数据",
+  "type": "object",
+  "required": ["asset_id", "source_path", "destination", "scenes", "metadata"],
+  "properties": {
+    "asset_id": {
+      "type": "string",
+      "description": "唯一标识，基于文件路径哈希"
+    },
+    "source_path": {
+      "type": "string",
+      "description": "原始文件路径"
+    },
+    "normalized_path": {
+      "type": "string",
+      "description": "转码后的标准化文件路径"
+    },
+    "destination": {
+      "type": "string",
+      "description": "自动识别的目的地，如 '日本-富士山'"
+    },
+    "scenes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Scene" },
+      "minItems": 1
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["duration", "has_audio", "quality_score"],
+      "properties": {
+        "duration": { "type": "number", "description": "总时长（秒）" },
+        "has_audio": { "type": "boolean" },
+        "quality_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "resolution": { "type": "string" },
+        "fps": { "type": "number" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "ingested_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "$defs": {
+    "Scene": {
+      "type": "object",
+      "required": ["start", "end", "summary"],
+      "properties": {
+        "start": { "type": "string", "description": "起始时间码 HH:MM:SS" },
+        "end": { "type": "string", "description": "结束时间码 HH:MM:SS" },
+        "start_sec": { "type": "number" },
+        "end_sec": { "type": "number" },
+        "summary": { "type": "string", "description": "场景摘要" },
+        "visual_tags": { "type": "array", "items": { "type": "string" } },
+        "motion_tags": { "type": "array", "items": { "type": "string" } },
+        "audio_tags": { "type": "array", "items": { "type": "string" } },
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "场景语义向量（CLIP / 多模态模型输出）"
+        },
+        "quality": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}
