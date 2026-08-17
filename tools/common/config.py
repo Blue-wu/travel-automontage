@@ -6,6 +6,13 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# 加载 .env 文件（如果存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -23,6 +30,18 @@ AGENTS_SKILLS_DIR = PROJECT_ROOT / "agents_skills"
 class GeminiConfig:
     api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
     model: str = "gemini-1.5-pro"
+
+
+@dataclass
+class DashScopeConfig:
+    """阿里云 DashScope (通义千问) 配置"""
+    api_key: str = field(default_factory=lambda: os.getenv("DASHSCOPE_API_KEY", ""))
+    # 视频理解模型（通用大模型，支持视频输入）
+    vl_model: str = "qwen3.8-max"
+    # 多模态向量模型（文本+图片+视频统一空间）
+    embedding_model: str = "qwen3-vl-embedding"
+    # embedding 维度
+    embedding_dim: int = 1024
 
 
 @dataclass
@@ -57,6 +76,7 @@ class FFmpegConfig:
 @dataclass
 class Settings:
     gemini: GeminiConfig = field(default_factory=GeminiConfig)
+    dashscope: DashScopeConfig = field(default_factory=DashScopeConfig)
     clip: CLIPConfig = field(default_factory=CLIPConfig)
     douyin: DouyinConfig = field(default_factory=DouyinConfig)
     ffmpeg: FFmpegConfig = field(default_factory=FFmpegConfig)

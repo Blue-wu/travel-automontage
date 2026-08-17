@@ -44,14 +44,23 @@ def cli(verbose: bool):
 
 @cli.command()
 @click.option("--footage-dir", "-d", required=True, help="素材目录路径")
+@click.option("--destination", "-dest", default=None, help="手动指定目的地")
+@click.option("--skip-transcode", is_flag=True, default=False, help="跳过转码步骤")
 @click.option("--skip-existing", is_flag=True, default=True, help="跳过已入库素材")
-def ingest(footage_dir: str, skip_existing: bool):
+def ingest(footage_dir: str, destination: str | None, skip_transcode: bool, skip_existing: bool):
     """素材入库 — 转码 + AI 分析 + 向量化"""
     from tools.ingest.travel_asset_ingestor import TravelAssetIngestor
 
     console.print(f"[cyan]开始入库: {footage_dir}[/]")
+    if destination:
+        console.print(f"[cyan]目的地: {destination}[/]")
     ingestor = TravelAssetIngestor()
-    assets = ingestor.ingest(footage_dir, skip_existing=skip_existing)
+    assets = ingestor.ingest(
+        footage_dir,
+        skip_existing=skip_existing,
+        skip_transcode=skip_transcode,
+        destination=destination,
+    )
 
     table = Table(title="入库结果")
     table.add_column("文件", style="cyan")

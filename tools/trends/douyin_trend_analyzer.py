@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 
 from tools.common.config import get_settings
 from tools.common.models import (
+    ContentTypeSuggestion,
     HookFormula,
     HotTopic,
     MusicTrend,
@@ -105,6 +106,77 @@ DEFAULT_MUSIC_TRENDS = [
     MusicTrend(bgm_name="日系City Pop", usage_count=7200, mood="energetic"),
 ]
 
+DEFAULT_CONTENT_TYPES = [
+    ContentTypeSuggestion(
+        type="guide",
+        name="攻略型",
+        description="实用攻略、避坑指南、行程规划，利他性强，收藏率高",
+        popularity=0.85,
+        storytelling_tips=[
+            "开头抛出痛点或常见误区",
+            "分点呈现，条理清晰",
+            "结尾给出总结或清单",
+            "多用数字增强可信度",
+        ],
+        hooks=[
+            "去了N次才总结出来的{destination}避坑指南",
+            "{destination}新手必看的5个建议",
+            "别再踩坑了！{destination}正确打开方式",
+        ],
+    ),
+    ContentTypeSuggestion(
+        type="emotional",
+        name="情感型",
+        description="情绪共鸣、治愈感、人生感悟，完播率高，容易引发评论",
+        popularity=0.78,
+        storytelling_tips=[
+            "用第一人称视角，讲个人感受",
+            "画面+音乐营造氛围",
+            "有起承转合的情绪曲线",
+            "结尾留有余韵或提问互动",
+        ],
+        hooks=[
+            "去了{destination}才明白，什么叫治愈",
+            "在{destination}的第3天，我突然不想走了",
+            "这大概就是旅行的意义吧",
+        ],
+    ),
+    ContentTypeSuggestion(
+        type="informational",
+        name="信息型",
+        description="盘点类、科普类、冷知识，信息密度高，转发率高",
+        popularity=0.72,
+        storytelling_tips=[
+            "用数字开头，明确信息量",
+            "每段一个知识点",
+            "节奏快，信息量大",
+            "结尾引导收藏",
+        ],
+        hooks=[
+            "关于{destination}的7个冷知识，第3个90%的人不知道",
+            "{destination}最值得去的10个地方",
+            "一分钟了解{destination}",
+        ],
+    ),
+    ContentTypeSuggestion(
+        type="vlog",
+        name="日常Vlog型",
+        description="真实记录、有活人感、像朋友分享，亲切感强，粉丝粘性高",
+        popularity=0.68,
+        storytelling_tips=[
+            "口语化表达，像跟朋友聊天",
+            "有小插曲小意外，真实不完美",
+            "有具体的时间线和行程",
+            "结尾有个人总结和感受",
+        ],
+        hooks=[
+            "辞职去旅行的第N天，我在{destination}",
+            "一个人的{destination}之旅",
+            "花了3000块去{destination}，值不值？",
+        ],
+    ),
+]
+
 
 class DouyinTrendAnalyzer:
     """抖音旅行赛道趋势分析器
@@ -152,6 +224,8 @@ class DouyinTrendAnalyzer:
         hook_formulas = self._extract_hooks(analyzed, focus)
         pacing_rules = self._extract_pacing(analyzed)
         music_trends = self._extract_music(analyzed)
+        content_type_suggestions = self._suggest_content_types(niche, destination)
+        recommended = self._pick_recommended_type(content_type_suggestions, hot_topics)
 
         report = TrendReport(
             niche=niche,
@@ -162,6 +236,8 @@ class DouyinTrendAnalyzer:
             hook_formulas=hook_formulas,
             pacing_rules=pacing_rules,
             music_trends=music_trends,
+            content_type_suggestions=content_type_suggestions,
+            recommended_content_type=recommended,
         )
 
         logger.info(f"趋势分析完成: {len(hot_topics)} 热词, {len(viral_patterns)} 规律, {len(hook_formulas)} 钩子")
@@ -449,6 +525,61 @@ class DouyinTrendAnalyzer:
             ))
 
         return trends if trends else DEFAULT_MUSIC_TRENDS
+
+    def _suggest_content_types(self, niche: str, destination: str | None) -> list[ContentTypeSuggestion]:
+        """根据目的地和赛道生成内容类型建议"""
+        suggestions = []
+
+        for ct in DEFAULT_CONTENT_TYPES:
+            adjusted = ContentTypeSuggestion(
+                type=ct.type,
+                name=ct.name,
+                description=ct.description,
+                popularity=ct.popularity,
+                storytelling_tips=list(ct.storytelling_tips),
+                hooks=[h.format(destination=destination or "这里") for h in ct.hooks],
+            )
+            suggestions.append(adjusted)
+
+        return suggestions
+
+    def _pick_recommended_type(
+        self,
+        content_types: list[ContentTypeSuggestion],
+        hot_topics: list[HotTopic],
+    ) -> ContentTypeSuggestion | None:
+        """根据热词分布推荐最合适的内容类型"""
+        if not content_types:
+            return None
+
+        scores = {}
+        for ct in content_types:
+            scores[ct.type] = ct.popularity
+
+        guide_keywords = ["攻略", "避坑", "指南", "推荐", "必去"]
+        emotional_keywords = ["治愈", "人生", "感动", "最美", "值得"]
+        info_keywords = ["冷知识", "盘点", "几个", "件事", "排名"]
+        vlog_keywords = ["vlog", "日常", "记录", "一个人", "辞职"]
+
+        for topic in hot_topics:
+            kw = topic.keyword
+            weight = topic.search_volume / 1000000.0
+
+            if any(k in kw for k in guide_keywords):
+                scores["guide"] += weight * 0.3
+            if any(k in kw for k in emotional_keywords):
+                scores["emotional"] += weight * 0.3
+            if any(k in kw for k in info_keywords):
+                scores["informational"] += weight * 0.3
+            if any(k in kw for k in vlog_keywords):
+                scores["vlog"] += weight * 0.3
+
+        best_type = max(scores, key=scores.get)
+        for ct in content_types:
+            if ct.type == best_type:
+                return ct
+
+        return content_types[0]
 
     def __del__(self):
         try:

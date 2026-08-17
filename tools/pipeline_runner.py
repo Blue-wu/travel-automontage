@@ -102,12 +102,21 @@ class PipelineRunner:
             try:
                 output = self._run_stage(stage)
                 self.stage_outputs[stage_name] = output
+                # 同时用 output 文件名（去掉后缀）作为 key，方便 YAML 中引用
+                output_file = stage.get("output", "")
+                if output_file:
+                    output_key = Path(output_file).stem
+                    self.stage_outputs[output_key] = output
                 console.print(f"  [green]✓ {stage_name} 完成[/]")
             except Exception as e:
                 on_failure = stage.get("on_failure", "fatal")
                 if on_failure == "warn":
                     console.print(f"  [yellow]⚠ {stage_name} 失败（warn）: {e}[/]")
                     self.stage_outputs[stage_name] = None
+                    output_file = stage.get("output", "")
+                    if output_file:
+                        output_key = Path(output_file).stem
+                        self.stage_outputs[output_key] = None
                 elif on_failure == "retry":
                     retry_config = stage.get("retry", {})
                     max_attempts = retry_config.get("max_attempts", 2)
@@ -115,6 +124,10 @@ class PipelineRunner:
                     console.print(f"  [red]✗ {stage_name} 失败，重试 {max_attempts} 次（回到 {back_to}）[/]")
                     # 简化：仅记录失败
                     self.stage_outputs[stage_name] = None
+                    output_file = stage.get("output", "")
+                    if output_file:
+                        output_key = Path(output_file).stem
+                        self.stage_outputs[output_key] = None
                 else:  # fatal
                     console.print(f"  [red]✗ {stage_name} 失败（fatal）: {e}[/]")
                     raise
@@ -196,39 +209,72 @@ class PipelineRunner:
         return result
 
     def _eval_expr(self, expr: str) -> Any:
-        """评估表达式，获取变量值"""
-        # 先检查是否是 stage 输出引用
-        if "." in expr:
-            parts = expr.split(".", 1)
-            root = parts[0]
-            rest = parts[1]
+        """评估表达式，获取变量值
 
-            if root in self.stage_outputs:
-                value = self.stage_outputs[root]
-                # 尝试获取嵌套属性
-                for attr in rest.split("."):
-                    if value is None:
-                        return None
-                    if isinstance(value, dict):
-                        value = value.get(attr)
-                    elif hasattr(value, attr):
-                        value = getattr(value, attr)
-                    elif hasattr(value, "model_dump"):
-                        dump = value.model_dump()
-                        value = dump.get(attr)
+        支持：
+        - 简单变量: {{destination}}
+        - 嵌套属性: {{trend_report.destination}}
+        - 数组索引: {{trend_report.hook_formulas[0].template}}
+        """
+        import re
+
+        tokens = self._tokenize_expr(expr)
+        if not tokens:
+            return f"{{{{{expr}}}}}"
+
+        root = tokens[0]
+        value = None
+
+        if root in self.stage_outputs:
+            value = self.stage_outputs[root]
+        elif root in self.variables:
+            value = self.variables[root]
+        else:
+            return f"{{{{{expr}}}}}"
+
+        for token in tokens[1:]:
+            if value is None:
+                return None
+
+            if token.startswith("[") and token.endswith("]"):
+                # 数组索引
+                try:
+                    idx = int(token[1:-1])
+                    if isinstance(value, (list, tuple)):
+                        value = value[idx]
                     else:
                         return None
-                return value
+                except (ValueError, IndexError):
+                    return None
+            else:
+                # 属性访问
+                if isinstance(value, dict):
+                    value = value.get(token)
+                elif hasattr(value, token):
+                    value = getattr(value, token)
+                elif hasattr(value, "model_dump"):
+                    dump = value.model_dump()
+                    value = dump.get(token)
+                else:
+                    return None
 
-        # 检查变量
-        if expr in self.variables:
-            return self.variables[expr]
+        return value
 
-        # 检查 stage 输出
-        if expr in self.stage_outputs:
-            return self.stage_outputs[expr]
+    def _tokenize_expr(self, expr: str) -> list[str]:
+        """将表达式拆分为 token 列表
 
-        return f"{{{{{expr}}}}}"  # 未找到，保留原样
+        例如: "trend_report.hook_formulas[0].template"
+        -> ["trend_report", "hook_formulas", "[0]", "template"]
+        """
+        import re
+        tokens = []
+        pattern = r'([^.\[\]]+)|\[(\d+)\]'
+        for match in re.finditer(pattern, expr):
+            if match.group(1):
+                tokens.append(match.group(1))
+            elif match.group(2):
+                tokens.append(f"[{match.group(2)}]")
+        return tokens
 
     def _save_output(self, result: Any, path: Path):
         """保存输出到文件"""

@@ -32,6 +32,12 @@ data/samples/*
 *.key
 credentials.json
 
+# Logs
+*.log
+
+# Test artifacts
+test_tts.mp3
+
 # OS
 .DS_Store
 Thumbs.db

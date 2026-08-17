@@ -6,7 +6,10 @@ Agent 在 edit_decision 阶段调用此工具，
 
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from tools.common.models import (
@@ -20,6 +23,23 @@ from tools.common.models import (
 logger = logging.getLogger(__name__)
 
 
+def _get_video_duration(video_path: str) -> float:
+    """用 ffprobe 获取视频总时长"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return float(data.get("format", {}).get("duration", 0))
+    except Exception:
+        pass
+    return 0.0
+
+
 class EditDecisionMaker:
     """剪辑决策器"""
 
@@ -28,6 +48,7 @@ class EditDecisionMaker:
         storyboard: list[dict[str, Any]],
         output_format: dict[str, Any] | None = None,
         bgm: dict[str, Any] | None = None,
+        voiceover: dict[str, Any] | None = None,
     ) -> EditDecision:
         """生成剪辑决策
 
@@ -35,6 +56,7 @@ class EditDecisionMaker:
             storyboard: 分镜列表
             output_format: 输出格式
             bgm: BGM 配置
+            voiceover: 旁白配音配置
 
         Returns:
             EditDecision: 剪辑决策
@@ -52,19 +74,38 @@ class EditDecisionMaker:
             # 提取素材信息
             asset_id = matched_clip.get("asset_id", "")
             source_path = matched_clip.get("source_path", "")
-            in_sec = float(matched_clip.get("start_sec", 0))
-            out_sec = float(matched_clip.get("end_sec", in_sec + 3))
+            clip_start = float(matched_clip.get("start_sec", 0))
+            clip_end = float(matched_clip.get("end_sec", clip_start + 3))
+            clip_mid = (clip_start + clip_end) / 2
 
-            # 分镜时长
-            duration = item.get("duration_sec", out_sec - in_sec)
+            # 分镜时长（剧本要求的时长）
+            target_duration = item.get("duration_sec", clip_end - clip_start)
             if "script_scene" in item:
                 script_scene = item["script_scene"]
                 if isinstance(script_scene, dict):
-                    duration = float(script_scene.get("duration_sec", duration))
+                    target_duration = float(script_scene.get("duration_sec", target_duration))
 
-            # 确保时长不超过素材实际长度
-            duration = min(duration, out_sec - in_sec)
-            out_sec = in_sec + duration
+            # 获取视频总时长，以场景为中心向前后扩展
+            video_duration = _get_video_duration(source_path)
+            if video_duration > 0 and target_duration > (clip_end - clip_start):
+                # 以场景中点为中心，扩展到目标时长
+                half = target_duration / 2
+                in_sec = max(0.1, clip_mid - half)
+                out_sec = min(video_duration, clip_mid + half)
+                # 如果靠边了，往另一边挪
+                if in_sec < 0.1:
+                    out_sec = min(video_duration, target_duration)
+                    in_sec = 0.1
+                if out_sec > video_duration:
+                    in_sec = max(0.1, video_duration - target_duration)
+                    out_sec = video_duration
+                duration = out_sec - in_sec
+            else:
+                # 视频太短或获取失败，用原片段
+                in_sec = clip_start
+                out_sec = clip_end
+                duration = min(target_duration, out_sec - in_sec)
+                out_sec = in_sec + duration
 
             # 转场
             transition = item.get("transition", "cut")
@@ -116,10 +157,17 @@ class EditDecisionMaker:
                 fade_out_sec=bgm.get("fade_out_sec", 1.0),
             )
 
+        vo_config = None
+        if voiceover and voiceover.get("path"):
+            vo_config = VoiceoverConfig(
+                path=voiceover["path"],
+                volume=voiceover.get("volume", 1.0),
+            )
+
         decision = EditDecision(
             timeline=timeline,
             bgm=bgm_config,
-            voiceover=None,
+            voiceover=vo_config,
             output_format=fmt,
             total_duration_sec=total_duration,
         )

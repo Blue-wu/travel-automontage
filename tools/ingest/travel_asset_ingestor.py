@@ -43,12 +43,24 @@ class TravelAssetIngestor:
         self.model_client = model_client or ModelClient()
         self.settings = get_settings()
 
-    def ingest(self, footage_dir: str, skip_existing: bool = True) -> list[Asset]:
+    def ingest(
+        self,
+        footage_dir: str,
+        skip_existing: bool = True,
+        skip_transcode: bool = False,
+        destination: str | None = None,
+        use_v2: bool = True,
+        hybrid_mode: bool = True,
+    ) -> list[Asset]:
         """入库整个目录的素材
 
         Args:
             footage_dir: 素材目录路径
             skip_existing: 是否跳过已入库的素材（基于路径去重）
+            skip_transcode: 是否跳过转码步骤
+            destination: 手动指定目的地
+            use_v2: 是否使用 V2 分析（镜头切分 + 多帧 + VideoMAE）
+            hybrid_mode: 混合模式（本地 CLIP + qwen 精选增强，省 token）
 
         Returns:
             入库成功的 Asset 列表
@@ -57,54 +69,286 @@ class TravelAssetIngestor:
         if not footage_path.exists():
             raise FileNotFoundError(f"素材目录不存在: {footage_path}")
 
+        video_list = list(self._scan_videos(footage_path))
+        total = len(video_list)
         ingested = []
-        for video_path in self._scan_videos(footage_path):
+        for idx, video_path in enumerate(video_list, 1):
             try:
-                # 检查是否已入库
                 if skip_existing:
                     existing = self.asset_store.get_by_path(str(video_path))
                     if existing is not None:
-                        logger.info(f"跳过已入库: {video_path.name}")
+                        logger.info(f"[{idx}/{total}] 跳过已入库: {video_path.name}")
                         ingested.append(existing)
                         continue
 
-                asset = self._ingest_single(video_path)
+                logger.info(f"[{idx}/{total}] 入库: {video_path.name}")
+                asset = self._ingest_single(
+                    video_path,
+                    skip_transcode=skip_transcode,
+                    override_destination=destination,
+                    use_v2=use_v2,
+                    hybrid_mode=hybrid_mode,
+                )
                 if asset:
                     self.asset_store.save(asset)
                     ingested.append(asset)
-                    logger.info(f"入库成功: {video_path.name} ({len(asset.scenes)} 场景)")
+                    logger.info(
+                        f"[{idx}/{total}] 入库成功: {video_path.name} "
+                        f"({len(asset.scenes)} 场景)"
+                    )
                 else:
-                    logger.warning(f"入库失败: {video_path.name}")
+                    logger.warning(f"[{idx}/{total}] 入库失败: {video_path.name}")
             except Exception as e:
-                logger.error(f"入库异常 {video_path.name}: {e}")
+                logger.error(f"[{idx}/{total}] 入库异常 {video_path.name}: {e}")
 
-        logger.info(f"入库完成: {len(ingested)}/{len(list(self._scan_videos(footage_path)))} 成功")
+        logger.info(f"入库完成: {len(ingested)}/{total} 成功")
         return ingested
 
-    def _ingest_single(self, video_path: Path) -> Asset | None:
-        """入库单个视频文件"""
+    def _ingest_single(
+        self,
+        video_path: Path,
+        skip_transcode: bool = False,
+        override_destination: str | None = None,
+        use_v2: bool = True,
+        hybrid_mode: bool = True,
+        qwen_quality_threshold: float = 0.75,
+    ) -> Asset | None:
+        """入库单个视频文件
+
+        Args:
+            hybrid_mode: 混合模式（默认开启）
+                - 本地 CLIP 做场景切分 + 分类 + 向量化（免费）
+                - 只对精彩场景用 qwen 生成描述（省 token）
+            qwen_quality_threshold: 精彩场景质量阈值，超过才调用 qwen 增强描述
+        """
         asset_id = self._generate_asset_id(str(video_path))
 
         # Step 1: 转码为统一格式
-        normalized_path = self._transcode(video_path)
+        if skip_transcode:
+            normalized_path = video_path
+        else:
+            normalized_path = self._transcode(video_path)
 
-        # Step 2: 逐段分析（上传到多模态模型 + 路径缓存）
-        analysis = self.model_client.analyze_video_scenes(str(normalized_path))
+        dest_hint = override_destination or ""
+
+        if hybrid_mode:
+            # ── 混合策略：本地 CLIP 分析 + qwen 精选增强 ──
+            analysis = self._hybrid_analyze(
+                str(normalized_path), dest_hint, qwen_quality_threshold
+            )
+        elif use_v2:
+            # V2 纯本地分析
+            analysis = self.model_client.analyze_video_scenes_v2(
+                str(normalized_path), use_video_embedding=False
+            )
+            analysis["destination"] = dest_hint
+        else:
+            # 旧策略：Qwen-VL 优先
+            analysis = self.model_client.analyze_video_scenes(
+                str(normalized_path), destination=dest_hint, use_qwen=True
+            )
 
         # Step 3: 构建场景列表 + 向量化
-        scenes = self._build_scenes(analysis, str(normalized_path))
+        scenes = self._build_scenes_with_embeddings(
+            analysis, str(normalized_path), str(video_path)
+        )
 
         # Step 4: 构建 Asset
         metadata = self._build_metadata(analysis, str(video_path))
+
+        dest = override_destination or analysis.get("destination", "")
 
         return Asset(
             asset_id=asset_id,
             source_path=str(video_path),
             normalized_path=str(normalized_path),
-            destination=analysis.get("destination", ""),
+            destination=dest,
             scenes=scenes,
             metadata=metadata,
         )
+
+    def _hybrid_analyze(
+        self,
+        video_path: str,
+        destination: str,
+        quality_threshold: float = 0.75,
+    ) -> dict:
+        """混合分析策略：本地 CLIP 切分 + 分类 + qwen 精选增强
+
+        流程：
+        1. PySceneDetect 镜头切分（免费）
+        2. 每镜头多帧 CLIP 分类 + 向量化（免费）
+        3. 对 quality > 阈值的精彩场景，抽关键帧用 qwen 生成描述（省 token）
+        4. 质量评分基于 CLIP 置信度 + 场景类型
+
+        成本：每个视频仅消耗 0-3 次 qwen 图片调用（而非整视频上传）
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        # Step 1+2: 本地 V2 分析（镜头切分 + CLIP 分类 + 向量化）
+        log.info(f"混合分析 [本地 CLIP]: {Path(video_path).name}")
+        analysis = self.model_client.analyze_video_scenes_v2(
+            video_path, use_video_embedding=False
+        )
+        analysis["destination"] = destination
+
+        scenes = analysis.get("scenes", [])
+        if not scenes:
+            return analysis
+
+        # Step 3: 对精彩场景用 qwen 增强描述
+        highlight_scenes = [
+            (i, s) for i, s in enumerate(scenes)
+            if s.get("quality", 0) >= quality_threshold
+        ]
+
+        if not highlight_scenes:
+            # 没有高质量场景，至少增强 top1
+            highlight_scenes = [max(enumerate(scenes), key=lambda x: x[1].get("quality", 0))]
+
+        log.info(
+            f"  精彩场景 {len(highlight_scenes)}/{len(scenes)} 个，"
+            f"用 qwen 增强描述（省 token 模式）"
+        )
+
+        qwen = self.model_client._get_qwen_analyzer()
+        if qwen is None:
+            log.info("  qwen 不可用，使用纯 CLIP 描述")
+            return analysis
+
+        # 对每个精彩场景抽关键帧用 qwen 生成描述
+        import subprocess
+        import tempfile
+        from tools.common.config import CACHE_DIR
+
+        frames_dir = CACHE_DIR / "hybrid_frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, scene in highlight_scenes:
+            start_sec = scene.get("start_sec", 0)
+            end_sec = scene.get("end_sec", 10)
+            mid_sec = (start_sec + end_sec) / 2
+
+            # 抽关键帧
+            frame_path = str(frames_dir / f"{Path(video_path).stem}_{idx}.jpg")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-ss", str(mid_sec), "-i", video_path,
+                        "-frames:v", "1", "-q:v", "3",
+                        "-vf", "scale=1280:-1",
+                        frame_path, "-y",
+                    ],
+                    check=True, capture_output=True, timeout=30,
+                )
+            except Exception as e:
+                log.debug(f"  抽帧失败（场景{idx}）: {e}")
+                continue
+
+            # 用 qwen 分析单张图片（比视频便宜 20-50 倍）
+            try:
+                enhanced = self._qwen_describe_frame(
+                    qwen, frame_path, destination, scene.get("scene_category", "")
+                )
+                if enhanced:
+                    # 合并增强结果（保留 CLIP 的 embedding 和分类，只更新描述和标签）
+                    scene["summary"] = enhanced.get("summary", scene.get("summary", ""))
+                    # 补充更丰富的标签
+                    existing_tags = set(scene.get("visual_tags", []))
+                    new_tags = enhanced.get("visual_tags", [])
+                    scene["visual_tags"] = list(existing_tags | set(new_tags))[:8]
+                    # 更新质量分（qwen 评分更准）
+                    q_quality = enhanced.get("quality")
+                    if q_quality and isinstance(q_quality, (int, float)):
+                        # 取 CLIP 和 qwen 的较高值
+                        scene["quality"] = max(scene.get("quality", 0.5), float(q_quality))
+                    # 补充 dominant_colors
+                    if enhanced.get("dominant_colors"):
+                        scene["dominant_colors"] = enhanced["dominant_colors"]
+                    log.info(f"  场景 {idx} 描述已增强: {scene['summary'][:40]}...")
+            except Exception as e:
+                log.debug(f"  qwen 增强失败（场景{idx}）: {e}")
+
+        return analysis
+
+    def _qwen_describe_frame(
+        self,
+        qwen_analyzer,
+        frame_path: str,
+        destination: str,
+        category_hint: str,
+    ) -> dict | None:
+        """用 qwen 对单张关键帧生成描述（省 token 模式）
+
+        相比整视频上传，单张图片只消耗 ~500-1000 token
+        """
+        import dashscope
+        from dashscope import MultiModalConversation
+
+        dashscope.api_key = qwen_analyzer.api_key
+
+        dest_hint = f"拍摄于{destination}。" if destination else ""
+        cat_hint = f"CLIP初步分类为{category_hint}。" if category_hint else ""
+
+        prompt = f"""请分析这张旅行视频截图。{dest_hint}{cat_hint}
+
+只返回JSON，不要其他文字：
+{{
+  "summary": "20-40字描述画面内容，要有画面感和情绪",
+  "visual_tags": ["具体标签1", "具体标签2", "具体标签3", "具体标签4", "具体标签5"],
+  "quality": 0.85,
+  "dominant_colors": ["颜色1", "颜色2"]
+}}
+
+quality评分标准：0.9+顶级震撼，0.8优秀，0.7良好，0.6可用，0.5一般。"""
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"image": f"file://{frame_path}"},
+                    {"text": prompt},
+                ],
+            }
+        ]
+
+        try:
+            response = MultiModalConversation.call(
+                model=qwen_analyzer.vl_model,
+                messages=messages,
+                result_format="message",
+            )
+
+            if response.status_code != 200:
+                return None
+
+            text = ""
+            for choice in response.output.choices:
+                content = choice.message.content
+                if isinstance(content, str):
+                    text += content
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and "text" in item:
+                            text += item["text"]
+
+            # 解析 JSON
+            import json
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(text[start:end])
+            return None
+
+        except Exception:
+            return None
 
     def _scan_videos(self, directory: Path) -> Iterator[Path]:
         """扫描目录中的视频文件"""
@@ -152,12 +396,216 @@ class TravelAssetIngestor:
             # 转码失败则用原文件
             return video_path
 
-    def _build_scenes(self, analysis: dict, normalized_path: str) -> list[Scene]:
-        """从分析结果构建场景列表，并尝试向量化"""
+    # ── 场景分类规范化映射 ──────────────────────────────────────────
+    # 将模型可能返回的各种分类名映射到标准分类
+    _CATEGORY_NORMALIZE_MAP = {
+        # 航拍相关
+        "aerial": "aerial",
+        "aerial_view": "aerial",
+        "drone": "aerial",
+        "overhead": "aerial",
+        "俯视": "aerial",
+        "航拍": "aerial",
+        # 雪山
+        "snow_mountain": "snow_mountain",
+        "snow": "snow_mountain",
+        "mountain": "snow_mountain",
+        "glacier": "snow_mountain",
+        "peak": "snow_mountain",
+        "雪山": "snow_mountain",
+        "山峰": "snow_mountain",
+        # 草原
+        "grassland": "grassland",
+        "meadow": "grassland",
+        "prairie": "grassland",
+        "pasture": "grassland",
+        "草原": "grassland",
+        "牧场": "grassland",
+        # 湖泊
+        "lake": "lake",
+        "pond": "lake",
+        "天池": "lake",
+        "湖泊": "lake",
+        # 河流
+        "river": "river",
+        "stream": "river",
+        "waterfall": "river",
+        "valley": "river",
+        "河流": "river",
+        "溪流": "river",
+        "瀑布": "river",
+        # 森林
+        "forest": "forest",
+        "woods": "forest",
+        "trees": "forest",
+        "森林": "forest",
+        "树林": "forest",
+        # 峡谷
+        "canyon": "canyon",
+        "cliff": "canyon",
+        "gorge": "canyon",
+        "yadan": "canyon",
+        "峡谷": "canyon",
+        # 沙漠
+        "desert": "desert",
+        "gobi": "desert",
+        "dune": "desert",
+        "沙漠": "desert",
+        "戈壁": "desert",
+        # 大海
+        "sea": "sea",
+        "ocean": "sea",
+        "beach": "sea",
+        "coast": "sea",
+        "大海": "sea",
+        "海滩": "sea",
+        # 公路
+        "road": "road",
+        "highway": "road",
+        "transport": "road",
+        "drive": "road",
+        "公路": "road",
+        "自驾": "road",
+        "道路": "road",
+        # 日出日落
+        "sunset": "sunset",
+        "sunrise": "sunset",
+        "dawn": "sunset",
+        "dusk": "sunset",
+        "日落": "sunset",
+        "日出": "sunset",
+        # 星空
+        "starry_sky": "starry_sky",
+        "stars": "starry_sky",
+        "galaxy": "starry_sky",
+        "night": "starry_sky",
+        "星空": "starry_sky",
+        "银河": "starry_sky",
+        "夜景": "starry_sky",
+        # 天空云海
+        "sky": "sky",
+        "clouds": "sky",
+        "cloud": "sky",
+        "fog": "sky",
+        "天空": "sky",
+        "云海": "sky",
+        "云彩": "sky",
+        "雾气": "sky",
+        # 建筑
+        "architecture": "architecture",
+        "building": "architecture",
+        "temple": "architecture",
+        "village": "architecture",
+        "建筑": "architecture",
+        "古迹": "architecture",
+        "寺庙": "architecture",
+        "村落": "architecture",
+        # 城市
+        "city": "city",
+        "town": "city",
+        "street": "city",
+        "城市": "city",
+        "城镇": "city",
+        # 花海
+        "flower": "flower",
+        "flowers": "flower",
+        "blossom": "flower",
+        "花海": "flower",
+        "花朵": "flower",
+        # 倒影
+        "reflection": "reflection",
+        "mirror": "reflection",
+        "倒影": "reflection",
+        # 人物
+        "people": "people",
+        "person": "people",
+        "portrait": "people",
+        "人物": "people",
+        "人像": "people",
+        "自拍": "people",
+        "landscape": "sky",  # landscape太笼统，默认归为天空/风景
+    }
+
+    @classmethod
+    def _normalize_category(cls, cat: str) -> str:
+        """将任意分类名规范化为标准分类"""
+        if not cat:
+            return "other"
+        # 先直接查
+        if cat in cls._CATEGORY_NORMALIZE_MAP:
+            return cls._CATEGORY_NORMALIZE_MAP[cat]
+        # 大小写不敏感
+        lower = cat.lower().strip()
+        if lower in cls._CATEGORY_NORMALIZE_MAP:
+            return cls._CATEGORY_NORMALIZE_MAP[lower]
+        # 关键词包含匹配
+        for key, val in cls._CATEGORY_NORMALIZE_MAP.items():
+            if key in lower:
+                return val
+        # 标准分类列表
+        std_cats = {
+            "snow_mountain", "grassland", "lake", "river", "forest", "canyon",
+            "desert", "sea", "road", "aerial", "sunset", "starry_sky", "sky",
+            "architecture", "city", "flower", "reflection", "people", "food",
+            "animal", "other",
+        }
+        if cat in std_cats:
+            return cat
+        # visual_tags 中是否包含分类关键词的二次判断在 _enhance_quality 处理
+        return "other"
+
+    @staticmethod
+    def _enhance_quality(quality: float, scene: dict) -> float:
+        """根据场景内容微调质量分，避免全是 0.52 的情况"""
+        q = float(quality)
+        # 如果质量分在 0.5-0.55 之间（模型偷懒给的默认值），根据标签推断
+        if 0.5 <= q <= 0.55:
+            tags = [t.lower() for t in scene.get("visual_tags", [])]
+            summary = (scene.get("summary", "") or "").lower()
+            category = scene.get("scene_category", "") or ""
+            cat_text = category.lower()
+
+            # 加分项（顶级/优秀素材特征）
+            high_value_keywords = [
+                "雪山", "雪峰", "日照", "金山", "银河", "星空", "倒影", "镜面",
+                "航拍", "全景", "云海", "震撼", "绝美", "圣湖", "冰川", "峡谷",
+                "日落", "日出", "夕阳", "晨雾", "花海", "牛羊", "草原", "湖泊",
+            ]
+            score = 0.0
+            for kw in high_value_keywords:
+                if any(kw in t for t in tags) or kw in summary or kw in cat_text:
+                    score += 0.05
+            # 标签数量越多，信息越丰富，质量越高
+            score += min(0.08, len(scene.get("visual_tags", [])) * 0.015)
+            q = min(0.92, 0.68 + score)
+
+        # 边界保护
+        return max(0.3, min(0.98, q))
+
+    def _build_scenes_with_embeddings(
+        self,
+        analysis: dict,
+        normalized_path: str,
+        source_path: str,
+    ) -> list[Scene]:
+        """从分析结果构建场景列表，并对每个场景做视频向量化
+
+        向量化策略：
+        1. 优先用多模态向量模型对视频片段编码（文本-视频同一空间）
+        2. 回退到 CLIP 抽帧向量化
+        """
         scenes_data = analysis.get("scenes", [])
         scenes = []
 
-        for s in scenes_data:
+        for i, s in enumerate(scenes_data):
+            # 规范化分类
+            raw_cat = s.get("scene_category", "other")
+            normalized_cat = self._normalize_category(raw_cat)
+
+            # 优化质量分
+            raw_quality = float(s.get("quality", 0.7))
+            enhanced_quality = self._enhance_quality(raw_quality, s)
+
             scene = Scene(
                 start=s.get("start", "00:00:00"),
                 end=s.get("end", "00:00:10"),
@@ -165,19 +613,43 @@ class TravelAssetIngestor:
                 end_sec=float(s.get("end_sec", 10)),
                 summary=s.get("summary", ""),
                 visual_tags=s.get("visual_tags", []),
+                scene_category=normalized_cat,
                 motion_tags=s.get("motion_tags", []),
                 audio_tags=s.get("audio_tags", []),
-                quality=float(s.get("quality", 0.7)),
+                quality=enhanced_quality,
+                people_count=int(s.get("people_count", 0)),
+                dominant_colors=s.get("dominant_colors", []),
             )
 
-            # 尝试 CLIP 向量化
-            try:
-                mid_sec = (scene.start_sec + scene.end_sec) / 2
-                embedding = self.model_client.embed_video_frame(normalized_path, mid_sec)
-                if embedding:
-                    scene.embedding = embedding
-            except Exception as e:
-                logger.debug(f"向量化失败（非致命）: {e}")
+            # 如果分析结果已包含 embedding，直接用
+            if s.get("embedding"):
+                scene.embedding = s["embedding"]
+                if s.get("video_embedding"):
+                    scene.video_embedding = s["video_embedding"]
+            else:
+                # 对视频片段做向量化
+                try:
+                    logger.info(
+                        f"  场景 {i+1}/{len(scenes_data)} 向量化: "
+                        f"{scene.start_sec:.1f}s-{scene.end_sec:.1f}s"
+                    )
+                    embedding = self.model_client.embed_video_clip(
+                        normalized_path,
+                        start_sec=scene.start_sec,
+                        end_sec=scene.end_sec,
+                    )
+                    if embedding:
+                        scene.embedding = embedding
+                    else:
+                        # 回退：抽中间帧 CLIP
+                        mid_sec = (scene.start_sec + scene.end_sec) / 2
+                        embedding = self.model_client.embed_video_frame(
+                            normalized_path, mid_sec
+                        )
+                        if embedding:
+                            scene.embedding = embedding
+                except Exception as e:
+                    logger.debug(f"向量化失败（非致命）: {e}")
 
             scenes.append(scene)
 

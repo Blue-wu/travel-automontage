@@ -16,10 +16,14 @@ class Scene(BaseModel):
     end_sec: float = 0.0
     summary: str = ""
     visual_tags: list[str] = Field(default_factory=list)
+    scene_category: str = "other"
     motion_tags: list[str] = Field(default_factory=list)
     audio_tags: list[str] = Field(default_factory=list)
     embedding: list[float] | None = None
+    video_embedding: list[float] | None = None
     quality: float = 0.0
+    people_count: int = 0
+    dominant_colors: list[str] = Field(default_factory=list)
 
 
 class AssetMetadata(BaseModel):
@@ -75,6 +79,16 @@ class MusicTrend(BaseModel):
     mood: str = ""
 
 
+class ContentTypeSuggestion(BaseModel):
+    """内容类型建议"""
+    type: str  # "guide"攻略型, "emotional"情感型, "informational"信息型, "vlog"日常Vlog型
+    name: str
+    description: str
+    popularity: float = 0.0
+    storytelling_tips: list[str] = Field(default_factory=list)
+    hooks: list[str] = Field(default_factory=list)
+
+
 class TrendReport(BaseModel):
     """抖音趋势分析报告"""
     niche: str
@@ -85,6 +99,8 @@ class TrendReport(BaseModel):
     hook_formulas: list[HookFormula] = Field(default_factory=list)
     pacing_rules: list[PacingRule] = Field(default_factory=list)
     music_trends: list[MusicTrend] = Field(default_factory=list)
+    content_type_suggestions: list[ContentTypeSuggestion] = Field(default_factory=list)
+    recommended_content_type: ContentTypeSuggestion | None = None
 
 
 class CandidateClip(BaseModel):
@@ -96,7 +112,16 @@ class CandidateClip(BaseModel):
     score: float
     scene_summary: str = ""
     visual_tags: list[str] = Field(default_factory=list)
+    scene_category: str = "other"
     quality: float = 0.0
+
+
+class SceneCategory(BaseModel):
+    """素材场景分类统计"""
+    category: str  # mountain/lake/grassland/forest/road/sunset/night/sky/architecture/food
+    display_name: str
+    count: int = 0
+    clips: list[CandidateClip] = Field(default_factory=list)
 
 
 class CandidateClips(BaseModel):
@@ -104,6 +129,9 @@ class CandidateClips(BaseModel):
     destination: str
     total_found: int = 0
     clips: list[CandidateClip] = Field(default_factory=list)
+    categories: list[SceneCategory] = Field(default_factory=list)
+    total_available_duration: float = 0.0
+    estimated_output_duration: float = 0.0
 
 
 class ScriptScene(BaseModel):
@@ -115,6 +143,8 @@ class ScriptScene(BaseModel):
     subtitle: str = ""
     transition: str = "cut"
     mood: str = ""
+    visual_keywords: list[str] = Field(default_factory=list)
+    shot_type: str = "medium"
 
 
 class Hook(BaseModel):
@@ -172,7 +202,7 @@ class VoiceoverConfig(BaseModel):
 class OutputFormat(BaseModel):
     width: int = 1080
     height: int = 1920
-    fps: int = 30
+    fps: float = 30.0
     codec: str = "h264"
     preset: str = "medium"
 

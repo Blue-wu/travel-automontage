@@ -9,11 +9,11 @@ pipeline:
 
   # 全局变量，可被 stages 中的 {{var}} 引用
   variables:
-    destination: "日本-富士山"
-    duration: 30
-    aspect_ratio: "9:16"
-    resolution: "1080x1920"
-    fps: 30
+    destination: "新疆"
+    duration: 0  # 0 = 素材驱动模式，自动决定时长
+    aspect_ratio: "original"  # original = 保持原素材比例
+    resolution: "original"    # original = 保持原素材分辨率
+    fps: 0  # 0 = 保持原素材帧率
 
   stages:
     # ── Stage 1: 趋势研究 ──
@@ -29,16 +29,14 @@ pipeline:
       on_failure: "warn"  # 趋势分析失败不阻塞，用默认 hooks
 
     # ── Stage 2: 素材检索 ──
-    # 从自有素材库中语义检索匹配的候选片段
+    # 获取某目的地全部素材并分类（素材驱动模式）
     - name: asset_retrieval
-      tool: tools.retrieve.semantic_asset_retriever.SemanticAssetRetriever.retrieve
+      tool: tools.retrieve.semantic_asset_retriever.SemanticAssetRetriever.retrieve_all
       input:
-        query: "{{trend_report.hook_formulas[0].template}} {{destination}}"
         destination: "{{destination}}"
-        top_k: 20
+        min_quality: 0.0
       output: candidate_clips.json
       output_schema: schemas/candidate_clips.schema.json
-      depends_on: [trend_research]
       on_failure: "fatal"
 
     # ── Stage 3: 剧本生成 ──
@@ -68,6 +66,18 @@ pipeline:
       depends_on: [script_generation]
       on_failure: "fatal"
 
+    # ── Stage 4.5: 配音生成 ──
+    # 将剧本旁白合成为中文语音
+    - name: voiceover_generation
+      tool: tools.audio.voiceover_generator.VoiceoverGenerator.generate
+      input:
+        script: "{{script}}"
+        output_dir: "data/output/voiceover_{{destination}}"
+        voice: "yunxi"  # 云希（年轻男声）
+      output: voiceover.json
+      depends_on: [script_generation]
+      on_failure: "warn"  # 配音失败不阻塞，继续生成无声视频
+
     # ── Stage 5: 剪辑决策 ──
     # 生最终剪辑指令：入点出点、转场、字幕、特效
     - name: edit_decision
@@ -75,13 +85,14 @@ pipeline:
       skill: skills/travel-pacing.md
       input:
         storyboard: "{{storyboard}}"
+        voiceover: "{{voiceover}}"
         output_format:
-          width: 1080
-          height: 1920
-          fps: 30
+          width: 0     # 0 = 保持原素材宽度
+          height: 0    # 0 = 保持原素材高度
+          fps: 0       # 0 = 保持原素材帧率
       output: edit_decision.json
       output_schema: schemas/edit_decision.schema.json
-      depends_on: [storyboard]
+      depends_on: [storyboard, voiceover_generation]
       on_failure: "fatal"
 
     # ── Stage 6: 渲染合成 ──
@@ -108,7 +119,6 @@ pipeline:
         - slideshow_risk_check    # 防止"假视频"（静态图片轮播）
         - audio_level_check        # 音频电平合规
         - subtitle_presence_check  # 必须有字幕
-        - douyin_format_check       # 9:16, 1080p, ≤60s
         - pacing_curve_check        # 动静节奏曲线
       on_failure: "retry"  # QA 不通过则回到 edit_decision 重做
       retry:
