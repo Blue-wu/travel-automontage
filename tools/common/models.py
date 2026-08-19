@@ -234,3 +234,50 @@ class QAReview(BaseModel):
     checks: list[QACheck] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+
+
+class CreativeBrief(BaseModel):
+    """创作 brief — 文案的「活人感」原料
+
+    trip_context 是唯一真正不可自动生成的输入。
+    见 skills/travel-copywriting.md §6 / §9。
+    """
+    destination: str = ""
+    # ★ 创作者提供的真实行程背景，1-3 句。没有它文案必然退化成套话
+    trip_context: str = ""
+    # 口吻：克制 / 文艺 / 沙雕 / 干货 / 知心朋友
+    persona: str = "克制、不煽情、像跟朋友讲事"
+    audience: str = ""
+    # 禁用词，会与 skill 里的禁用清单合并
+    avoid: list[str] = Field(default_factory=list)
+
+
+class TripFacts(BaseModel):
+    """从素材元数据自动重建的行程事实骨架（skills/travel-copywriting.md §9）"""
+    date_range: str = ""
+    days: int = 0
+    locations: list[str] = Field(default_factory=list)
+    # 每天拍了什么类型的场景
+    daily_scene_types: dict[str, list[str]] = Field(default_factory=dict)
+    # 最早/最晚的拍摄时刻 —— "十点天还亮着"这类句子的来源
+    earliest_shot_time: str = ""
+    latest_shot_time: str = ""
+    # 停留最久 / 素材最密集的地点
+    densest_location: str = ""
+    total_clips: int = 0
+
+    def to_prompt_block(self) -> str:
+        lines = []
+        if self.date_range:
+            lines.append(f"- 拍摄日期：{self.date_range}（共 {self.days} 天）")
+        if self.locations:
+            lines.append(f"- 路线：{' → '.join(self.locations)}")
+        if self.latest_shot_time:
+            lines.append(f"- 每天最晚拍到：{self.latest_shot_time}")
+        if self.earliest_shot_time:
+            lines.append(f"- 每天最早拍摄：{self.earliest_shot_time}")
+        if self.densest_location:
+            lines.append(f"- 素材最集中的地点：{self.densest_location}（停留最久）")
+        for day, types in list(self.daily_scene_types.items())[:8]:
+            lines.append(f"- {day}：{'、'.join(types)}")
+        return "\n".join(lines)

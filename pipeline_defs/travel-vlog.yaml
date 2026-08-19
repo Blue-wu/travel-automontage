@@ -10,6 +10,9 @@ pipeline:
   # 全局变量，可被 stages 中的 {{var}} 引用
   variables:
     destination: "新疆"
+    # ★ 创作者填写的真实行程背景（1-3 句），文案活人感的唯一来源
+    # 见 skills/travel-copywriting.md §6；留空则文案只能写通用句
+    trip_context: ""
     duration: 0  # 0 = 素材驱动模式，自动决定时长
     aspect_ratio: "original"  # original = 保持原素材比例
     resolution: "original"    # original = 保持原素材分辨率
@@ -95,15 +98,35 @@ pipeline:
       depends_on: [storyboard, voiceover_generation]
       on_failure: "fatal"
 
+    # ── Stage 5.5: 文案生成 ★ ──
+    # 时间线定稿后，由 LLM 一次性生成整条片子的全部字幕。
+    # 必须在 edit_decision 之后：字幕要卡镜头时长、要首尾呼应、时序不能矛盾，
+    # 这些只有时间线确定后才有完整上下文。
+    # 逐镜头独立生成（旧 script_generator 的 random.choice）结构上产生不了呼应。
+    - name: copywriting
+      tool: tools.edit.copywriter.Copywriter.write
+      skill: skills/travel-copywriting.md
+      input:
+        edit_decision: "{{edit_decision}}"
+        brief:
+          destination: "{{destination}}"
+          # ★ 活人感的唯一来源，必须由创作者填写真实经历，见 skill §6
+          trip_context: "{{trip_context}}"
+          persona: "克制、不煽情、像跟朋友讲事"
+        trip_facts: "{{trip_facts}}"
+      output: edit_decision_copy.json
+      depends_on: [edit_decision]
+      on_failure: "warn"   # 文案失败不阻塞渲染，退回模板字幕
+
     # ── Stage 6: 渲染合成 ──
     - name: compose
       tool: tools.compose.ffmpeg_composer.FFmpegComposer.compose
       skill: agents_skills/ffmpeg.md
       input:
-        edit_decision: "{{edit_decision}}"
+        edit_decision: "{{edit_decision_copy}}"
         output_path: "data/output/final_{{destination}}.mp4"
       output: final_video.mp4
-      depends_on: [edit_decision]
+      depends_on: [copywriting]
       on_failure: "fatal"
 
     # ── Stage 7: 质量自检 ──

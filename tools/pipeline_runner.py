@@ -26,7 +26,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from tools.common.config import DATA_DIR, OUTPUT_DIR, PIPELINE_DEFS_DIR
+from tools.common.config import DATA_DIR, OUTPUT_DIR, PIPELINE_DEFS_DIR, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -147,6 +147,11 @@ class PipelineRunner:
         # 导入并调用工具
         tool = self._import_tool(tool_path)
 
+        # 注入 skill 文本 —— YAML 里声明的 skill: 此前从未被加载过，
+        # 整个「知识层」对自动化路径是装饰性的。
+        # 只在工具签名确实接受 skill_text 时注入，避免影响其他工具。
+        self._inject_skill(stage, tool, input_data)
+
         # 调用工具
         result = tool(**input_data) if input_data else tool()
 
@@ -158,6 +163,28 @@ class PipelineRunner:
             self._save_output(result, output_path)
 
         return result
+
+    def _inject_skill(self, stage: dict, tool, input_data: dict) -> None:
+        """把 stage 的 skill: 指向的 Markdown 读进来，作为 skill_text 传给工具"""
+        skill_rel = stage.get("skill")
+        if not skill_rel:
+            return
+
+        import inspect
+        try:
+            params = inspect.signature(tool).parameters
+        except (TypeError, ValueError):
+            return
+        if "skill_text" not in params:
+            return
+
+        skill_path = PROJECT_ROOT / skill_rel
+        if not skill_path.exists():
+            console.print(f"  [yellow]⚠ skill 文件不存在: {skill_rel}[/]")
+            return
+
+        input_data["skill_text"] = skill_path.read_text(encoding="utf-8")
+        console.print(f"  [dim]↳ 已加载 skill: {skill_rel}[/]")
 
     def _import_tool(self, tool_path: str):
         """动态导入工具
