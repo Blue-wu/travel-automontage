@@ -25,7 +25,7 @@ from tools.common.models import CreativeBrief, EditDecision, TripFacts
 logger = logging.getLogger(__name__)
 
 
-# 兜底禁用清单（正常情况下从 skill_text 的 §2 代码块解析，此处仅作 fallback）
+# 兜底禁用清单（正常情况下从 skill_text 的「禁用清单」小节解析，此处仅作 fallback）
 FALLBACK_BANNED = [
     "人间值得", "治愈瞬间", "这就是远方", "来了就懂了",
     "什么都不想了", "时间慢下来了", "被治愈的一天", "安静且自由",
@@ -140,8 +140,10 @@ class Copywriter:
                 "at": round(t, 1),
                 "duration": round(d, 1),
                 "max_chars": max_chars(d),
-                # 画面描述 —— 质量直接决定文案质量（skill §6）
-                "visual": item.narration_text or "",
+                # 画面描述 + 具体物件 —— 错位手法的抓手（skill §7）
+                # "湖泊"抓不出手法，"没化完的浮冰"才能抓出"冰敷"
+                "visual": item.visual_summary or item.narration_text or "",
+                "subjects": item.visual_tags or [],
                 "source": item.source_path,
             })
             t += d
@@ -160,13 +162,18 @@ class Copywriter:
         system = skill_text.strip() or "你是旅行 Vlog 字幕撰稿人。"
         system += (
             "\n\n---\n\n"
-            "你现在要为一条已定稿的时间线撰写全部画面字幕。"
-            "严格遵守上面的规范，特别是：\n"
-            "1. 每一条都必须通过【替换测试】——把地名换掉后句子还成立的，一律重写\n"
-            "2. 禁用清单里的词及其近义变体一律不得出现\n"
-            "3. 严格遵守每个镜头给出的 max_chars；max_chars=0 的镜头必须留空\n"
-            "4. 整条覆盖率 40%-60%，即约一半镜头应当留空\n"
-            "5. 必须有一组首尾呼应、一条意外、一条身体感受\n"
+            "你现在要为一条已定稿的时间线撰写全部画面字幕。核心要求：\n"
+            "1. 【预测测试】遮住字幕只看画面，观众能猜到的一律重写。"
+            "描述画面的、抒情的，都是猜得到的。\n"
+            "2. 每条有字的字幕标注所用手法 device（A 场景误读 / B 宏大降格 / "
+            "C 身份错位 / D 数值荒诞 / E 错位归因），平实句留空字符串。"
+            "标不出手法的通常就是套话。\n"
+            "3. 【控制用力】整条片子错位手法只用 2-4 处，其余有字的镜头写平实句。"
+            "全是梗，梗就不响了。\n"
+            "4. 严格遵守每个镜头的 max_chars；max_chars=0 必须留空。\n"
+            "5. 覆盖率 40%-60%，约一半镜头留空。\n"
+            "6. 必须有一组首尾呼应；同片内不复用同一手法。\n"
+            "7. 写不出错位就写平实事实，**绝不退回抒情套话**。\n"
             "只输出 JSON，不要 markdown 代码块。"
         )
 
@@ -189,12 +196,14 @@ class Copywriter:
         parts.append(f"## 禁用词\n{'、'.join(banned)}\n")
 
         parts.append("## 时间线\n")
-        parts.append("| # | 起始 | 时长 | 字数上限 | 画面 |")
-        parts.append("|---|---|---|---|---|")
-        for s in shots:
-            cap = "**必须留空**" if s["max_chars"] == 0 else str(s["max_chars"])
+        parts.append("| # | 起始 | 时长 | 字数上限 | 画面 | 画面物件（错位抓手）|")
+        parts.append("|---|---|---|---|---|---|")
+        for sh in shots:
+            cap = "**必须留空**" if sh["max_chars"] == 0 else str(sh["max_chars"])
+            subj = "、".join(sh.get("subjects") or []) or "—"
             parts.append(
-                f"| {s['order']} | {s['at']}s | {s['duration']}s | {cap} | {s['visual'] or '（无描述）'} |"
+                f"| {sh['order']} | {sh['at']}s | {sh['duration']}s | {cap} "
+                f"| {sh['visual'] or '（无描述）'} | {subj} |"
             )
 
         if problems and previous:
@@ -205,10 +214,14 @@ class Copywriter:
 
         parts.append(
             "\n## 输出格式\n"
-            '{"subtitles":[{"order":1,"text":"独库还没开","reason":"意外·埋呼应"}],'
+            '{"subtitles":['
+            '{"order":1,"text":"独库还在放假","device":"C","reason":"身份错位·埋呼应"},'
+            '{"order":2,"text":"","device":"","reason":"快剪留空"},'
+            '{"order":6,"text":"湖还在冰敷","device":"A","reason":"抓手=浮冰，结冰→冰敷"}],'
             '"callback_pair":[1,15],'
-            '"self_check":{"substitution_test_passed":true,"banned_words_used":[],'
-            '"coverage_rate":0.47,"has_accident":"","has_body_feeling":"","screenshot_line":""}}'
+            '"self_check":{"prediction_test_passed":true,"banned_words_used":[],'
+            '"coverage_rate":0.47,"device_count":4,"devices_used":["A","C","E"],'
+            '"strongest_line":"太阳在新疆加班"}}'
         )
         return system, "\n".join(parts)
 
@@ -270,10 +283,13 @@ class Copywriter:
 
     @staticmethod
     def _parse_banned(skill_text: str) -> list[str]:
-        """从 skill 的 §2 代码块解析禁用清单，保持单一事实来源"""
+        """从 skill 的「禁用清单」小节解析，保持单一事实来源。
+
+        按标题匹配而非章节号 —— 规范改版重排章节时不会失效。
+        """
         if not skill_text:
             return []
-        m = re.search(r"##\s*2\.[^\n]*\n(.*?)(?=\n##\s)", skill_text, re.S)
+        m = re.search(r"##\s*\d+\.\s*禁用清单[^\n]*\n(.*?)(?=\n##\s)", skill_text, re.S)
         if not m:
             return []
         section = m.group(1)
@@ -318,13 +334,29 @@ class Copywriter:
                 f"字幕覆盖率 {rate:.0%} 超出 40%-60% 区间（当前 {filled}/{len(by_order)} 条有字）"
             )
 
-        chk = result.get("self_check") or {}
-        if not chk.get("has_accident"):
-            problems.append("缺少「意外与不完美」类字幕（skill §3.3）")
-        if not chk.get("has_body_feeling"):
-            problems.append("缺少「身体感受」类字幕（skill §3.4）")
+        # 错位手法：数量和多样性（skill §2 / §3）
+        devices = [
+            (s.get("device") or "").strip().upper()
+            for s in result.get("subtitles", [])
+            if (s.get("text") or "").strip()
+        ]
+        used = [d for d in devices if d in {"A", "B", "C", "D", "E"}]
+        if len(used) < 2:
+            problems.append(
+                f"错位手法只用了 {len(used)} 处，至少 2 处（skill §2）。"
+                "全是平实句会平淡"
+            )
+        elif len(used) > 4:
+            problems.append(
+                f"错位手法用了 {len(used)} 处，上限 4 处（skill §3）。"
+                "全是梗，梗就不响了 —— 改几条为平实句"
+            )
+        dup = {d for d in used if used.count(d) > 1}
+        if dup:
+            problems.append(f"手法 {'、'.join(sorted(dup))} 重复使用，同片内应轮换（skill §6.3）")
+
         if not result.get("callback_pair"):
-            problems.append("缺少首尾呼应（skill §5.2）")
+            problems.append("缺少首尾呼应（skill §6.2）")
         return problems
 
     def _apply(self, ed: EditDecision, result: dict, shots: list[dict]) -> None:

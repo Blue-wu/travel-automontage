@@ -139,6 +139,9 @@ class EditDecisionMaker:
                 subtitle_style=self._default_subtitle_style(),
                 effects=effects,
                 narration_text=item.get("script_scene", {}).get("narration", "") if isinstance(item.get("script_scene"), dict) else "",
+                # 画面原料透传给 copywriting stage 做错位抓手
+                visual_summary=matched_clip.get("scene_summary", "") or "",
+                visual_tags=list(matched_clip.get("visual_tags") or []),
             )
 
             timeline.append(timeline_item)

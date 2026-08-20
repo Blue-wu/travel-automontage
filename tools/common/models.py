@@ -185,6 +185,11 @@ class TimelineItem(BaseModel):
     subtitle_style: dict[str, Any] = Field(default_factory=dict)
     effects: list[dict[str, Any]] = Field(default_factory=list)
     narration_text: str = ""
+    # ── 供 copywriting stage 使用的画面原料 ──
+    # 错位手法（skills/travel-copywriting.md §2 手法A）需要画面里的具体物件做抓手。
+    # "湖泊"抓不出手法，"没化完的浮冰"才能抓出"冰敷"。
+    visual_summary: str = ""
+    visual_tags: list[str] = Field(default_factory=list)
 
 
 class BgmConfig(BaseModel):
