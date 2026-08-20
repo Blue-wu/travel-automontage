@@ -379,3 +379,73 @@ class Copywriter:
             f"文案完成: {n}/{len(ed.timeline)} 条字幕 "
             f"(覆盖率 {n / max(1, len(ed.timeline)):.0%})"
         )
+
+
+# ── 独立命令行入口 ────────────────────────────────────────────
+# 不跑整条流水线，直接给已有的 edit_decision.json 配字幕：
+#   python -m tools.edit.copywriter -e data/output/edit_decision.json \
+#          -d 新疆 -c "五月底自驾伊犁，独库还没开，绕了果子沟"
+
+def _main() -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="为已有时间线生成画面字幕")
+    ap.add_argument("-e", "--edit-decision", required=True, help="edit_decision.json 路径")
+    ap.add_argument("-d", "--destination", default="", help="目的地")
+    ap.add_argument("-c", "--trip-context", default="",
+                    help="真实行程背景 1-3 句（手法 B/D 的唯一原料，强烈建议填）")
+    ap.add_argument("-p", "--persona", default="克制、不煽情、像跟朋友讲事")
+    ap.add_argument("-s", "--skill", default="skills/travel-copywriting.md")
+    ap.add_argument("-o", "--out", default="", help="写回路径，默认只打印不落盘")
+    ap.add_argument("--avoid", nargs="*", default=[], help="额外禁用词")
+    args = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    from pathlib import Path
+
+    ed_path = Path(args.edit_decision)
+    if not ed_path.exists():
+        raise SystemExit(f"✗ 找不到 {ed_path}")
+    ed = EditDecision(**json.loads(ed_path.read_text(encoding="utf-8")))
+
+    skill_path = Path(args.skill)
+    skill_text = skill_path.read_text(encoding="utf-8") if skill_path.exists() else ""
+    if not skill_text:
+        print(f"⚠ 规范文件不存在: {skill_path} —— 将只用兜底禁用清单，效果会明显变差")
+    if not args.trip_context:
+        print("⚠ 未提供 --trip-context —— 手法 B/D 无原料，只能写平实句")
+
+    brief = CreativeBrief(
+        destination=args.destination,
+        trip_context=args.trip_context,
+        persona=args.persona,
+        avoid=list(args.avoid),
+    )
+
+    result = Copywriter().write(ed, brief=brief, skill_text=skill_text)
+
+    print(f"\n{'#':>3}  {'时长':>6}  {'上限':>4}  字幕")
+    print("-" * 60)
+    filled = 0
+    for it in result.timeline:
+        cap = max_chars(it.duration_sec)
+        text = it.subtitle or "—"
+        if it.subtitle:
+            filled += 1
+        print(f"{it.order:>3}  {it.duration_sec:>5.1f}s  {cap:>4}  {text}")
+    total = len(result.timeline)
+    print("-" * 60)
+    print(f"覆盖率 {filled}/{total} = {filled / max(1, total):.0%}"
+          f"（目标 40%-60%）")
+
+    if args.out:
+        Path(args.out).write_text(
+            json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"已写入 {args.out}")
+
+
+if __name__ == "__main__":
+    _main()
