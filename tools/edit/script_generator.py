@@ -851,38 +851,21 @@ class ScriptGenerator:
         return None
 
     def _get_visual_keywords(self, category: SceneCategory | None, clip=None) -> list[str]:
-        """获取视觉关键词（优先用真实素材标签）"""
-        if clip and clip.visual_tags:
-            tags = list(clip.visual_tags)[:6]
-            if len(tags) >= 3:
-                return tags
+        """获取视觉关键词 —— 只用素材里真实存在的物件
 
-        keyword_map = {
-            "snow_mountain": ["雪山", "山脉", "峰", "冰川", "雄伟", "壮观"],
-            "lake": ["湖泊", "水", "蓝天", "倒影", "宁静"],
-            "river": ["河流", "瀑布", "溪流", "江水", "清澈"],
-            "sea": ["大海", "海滩", "海浪", "沙滩", "蔚蓝"],
-            "grassland": ["草原", "草地", "牛羊", "绿色", "广阔"],
-            "forest": ["森林", "树木", "云杉", "光影", "幽静"],
-            "desert": ["沙漠", "戈壁", "沙丘", "黄沙", "荒凉"],
-            "canyon": ["峡谷", "悬崖", "峭壁", "地貌", "壮观"],
-            "road": ["公路", "旅途", "沿途", "风景", "在路上"],
-            "sunset": ["日落", "晚霞", "金色", "夕阳", "黄昏"],
-            "starry_sky": ["星空", "银河", "夜景", "夜空", "宁静"],
-            "sky": ["天空", "云海", "航拍", "全景", "辽阔"],
-            "flower": ["花海", "花朵", "野花", "绽放", "美丽"],
-            "architecture": ["建筑", "人文", "街道", "当地", "生活"],
-            "city": ["城市", "都市", "繁华", "地标", "街道"],
-            "food": ["美食", "小吃", "当地", "味道", "特色"],
-            "people": ["人物", "人像", "自拍", "朋友", "旅行"],
-            "animal": ["动物", "野生动物", "自然", "生态"],
-            "aerial": ["航拍", "俯视", "鸟瞰", "全景", "高空"],
-            "reflection": ["倒影", "镜面", "对称", "宁静", "美丽"],
-        }
-
-        if category:
-            return keyword_map.get(category.category, ["风景", "旅行"])
-        return ["风景", "旅行"]
+        原实现内嵌了一份 类别→关键词 查表（和 clip_classifier.VISUAL_TAG_CANDIDATES
+        是两份互不同步的表），命中时返回的是类别同义词而非画面内容，
+        对文案毫无价值："湖泊/湛蓝/倒影" 写不出任何有意思的东西。
+        现在改为：拿得到具体物件就用，拿不到就返回空，让下游走留白而不是套话。
+        """
+        if clip is None:
+            return []
+        # subjects 优先 —— 那才是具体物件（skills/travel-copywriting.md 手法 A 抓手）
+        subjects = list(getattr(clip, "subjects", None) or [])
+        if subjects:
+            return subjects[:6]
+        tags = list(getattr(clip, "visual_tags", None) or [])
+        return tags[:6]
 
     def _generate_narration(
         self,

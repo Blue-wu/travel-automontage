@@ -143,75 +143,102 @@ class QwenVLAnalyzer:
             return None
 
     def _build_analysis_prompt(self, destination: str) -> str:
-        """构建视频分析 prompt"""
+        """构建视频分析 prompt
+
+        关键设计：输出的不只是一个分类枚举，而是**具体物件 + 结构化属性**。
+        旧版只输出 scene_category + 一组类别同义词标签，信息在入库时就被压扁，
+        导致检索粒度过粗、文案抓不出错位手法（"湖泊"抓不出，"没化完的浮冰"才能）。
+        """
+        from tools.common.vocab import (
+            CAMERA_MOTION_CN, SCENE_CATEGORY_CN, SHOT_SCALE_CN, TIME_OF_DAY_CN,
+        )
+
         dest_hint = f"这是在{destination}拍摄的旅行视频。" if destination else ""
+        cats = "\n".join(f"- {k}: {v}" for k, v in SCENE_CATEGORY_CN.items())
+        scales = "\n".join(f"- {k}: {v}" for k, v in SHOT_SCALE_CN.items())
+        motions = "\n".join(f"- {k}: {v}" for k, v in CAMERA_MOTION_CN.items())
+        tods = "、".join(f"{k}({v})" for k, v in TIME_OF_DAY_CN.items())
 
         return f"""请仔细分析这段旅行视频。{dest_hint}
 
-请先完整观看视频，理解每个镜头的内容，然后按场景分段输出结构化JSON。
+先完整观看，理解每个镜头的内容和运镜，再按场景分段输出结构化 JSON。
 
-## 场景分类体系（scene_category必须从以下列表中选择最匹配的一个）：
-- snow_mountain: 雪山、冰川、山峰
-- grassland: 草原、牧场、草甸、牛羊群
-- lake: 湖泊、天池、水塘、湖面倒影
-- river: 河流、溪流、瀑布、河谷
-- forest: 森林、树林、针叶林、白桦林
-- canyon: 峡谷、悬崖、峭壁、雅丹地貌
-- desert: 沙漠、戈壁、沙丘
-- sea: 大海、海滩、海岸线
-- road: 公路、自驾、道路、开车、沿途风光
-- aerial: 航拍、无人机、俯视、上帝视角（当主要镜头是航拍时用这个）
-- sunset: 日落、日出、黄昏、晨光
-- starry_sky: 星空、银河、夜景
-- sky: 天空、云海、云彩、雾气
-- architecture: 建筑、古迹、寺庙、村落、人文建筑
-- city: 城市、街道、城镇
-- flower: 花海、花朵、野花、花丛
-- reflection: 水面倒影、镜子反射
-- people: 人物、人像、自拍、人群
-- food: 美食、餐饮、食物
-- animal: 动物、牛羊、马、野生动物
-- other: 其他无法归类的场景
+## 最重要的一件事：subjects 必须是画面里真实存在的具体物件
 
-注意：航拍优先看内容，如果是航拍草原就用grassland，如果是纯航拍视角（看不出具体内容）才用aerial。
+这个字段决定了后续文案能不能写出有意思的东西，**不要填类别的同义词**。
 
-## 质量评分标准（quality 0-1）：
-- 0.9+：顶级素材，构图完美，光线绝佳，画面震撼，有强烈视觉冲击力（如：日照金山、星空银河、绝美倒影、震撼航拍全景）
-- 0.8-0.89：优秀素材，构图好，光线佳，画面美丽（如：草原牛羊、湖泊风光、雪山远景）
-- 0.7-0.79：良好素材，画面清晰，内容不错（如：普通公路风景、一般近景）
-- 0.6-0.69：可用素材，画面一般但能用（如：普通特写、轻微晃动）
-- 0.5-0.59：一般素材，有瑕疵（如：构图一般、光线不足）
-- <0.5：差素材，不建议使用（如：严重模糊、过曝、内容空）
+✗ 错误（这些是类别同义词，等于没有信息）：
+   ["湖泊","湛蓝","倒影","雪山"]   ["草原","绿色","广阔"]
+✓ 正确（具体、可指认、有辨识度的东西）：
+   ["没化完的浮冰","岸边碎石","远处的雪线","一只落单的水鸟"]
+   ["散开的羊群","牧民的摩托车","被压倒的草","铁丝网"]
 
-## 输出JSON格式：
-{{
+判据：**这个词能不能让人在画面里指出来？** 不能就换掉。
+"湛蓝"指不出来，"浮冰"指得出来。
+
+## 场景分类（scene_category，选最匹配的一个；这只是索引，不要用它代替 subjects）
+{cats}
+航拍优先看内容：航拍草原就填 grassland，只有看不出具体内容的纯航拍视角才填 aerial。
+
+## 景别（shot_scale，按画面占比严格判断）
+{scales}
+
+## 运镜（camera_motion，只描述【相机】怎么动，不是画面里的东西怎么动）
+{motions}
+
+## 时段光线（time_of_day，按光线色温和方向判断）
+{tods}
+
+## 可用区间（usable_start_sec / usable_end_sec）
+必须**去掉起幅和落幅** —— 开头镜头还没稳、结尾开始甩向别处的部分要排除。
+这两个值是剪辑真正会用的入点出点，请严格判断，这直接决定成片是否毛糙。
+
+## 质量评分（quality 0-1，要能横向比较，别都给 0.8）
+- 0.9+   顶级：构图完美、光线绝佳、有强烈视觉冲击（日照金山、星空银河、绝美倒影）
+- 0.8-89 优秀：构图好、光线佳
+- 0.7-79 良好：画面清晰、内容不错
+- 0.6-69 可用：一般但能用
+- 0.5-59 有瑕疵：构图一般或光线不足
+- <0.5   差：严重模糊、过曝、内容空
+
+## 输出 JSON
+{{{{
   "destination": "{destination}",
   "scenes": [
-    {{
+    {{{{
       "start_sec": 0.0,
       "end_sec": 5.0,
-      "summary": "详细描述画面内容，要有画面感，20-50字，包含氛围和情绪（如：航拍视角俯瞰翠绿的草原，牛羊散落其间，远山如黛，宁静辽阔）",
-      "visual_tags": ["标签1", "标签2", "标签3", "标签4", "标签5"],
-      "scene_category": "snow_mountain",
-      "motion_tags": ["航拍推进"],
-      "audio_tags": ["有背景音乐"],
+      "usable_start_sec": 0.8,
+      "usable_end_sec": 4.6,
+      "summary": "20-50字，描述画面里有什么，要有画面感和氛围（如：航拍俯瞰翠绿草原，羊群散落其间，远山如黛）",
+      "subjects": ["具体物件1", "具体物件2", "具体物件3"],
+      "visual_tags": ["标签1", "标签2", "标签3"],
+      "scene_category": "grassland",
+      "shot_scale": "ELS",
+      "camera_motion": "aerial",
+      "time_of_day": "golden_hour",
+      "weather": "晴",
+      "mood": "epic",
+      "has_person": false,
+      "has_speech": false,
+      "ambient_sound": ["风声"],
       "quality": 0.85,
+      "defects": [],
       "people_count": 0,
       "dominant_colors": ["绿色", "蓝色"]
-    }}
+    }}}}
   ],
   "quality_score": 0.85,
   "all_tags": ["草原", "雪山", "航拍"]
-}}
+}}}}
 
-## 要求：
-1. 按画面内容变化自然分段，每段时长3-15秒，总场景数2-10个
-2. start_sec/end_sec 精确到0.1秒
-3. visual_tags 5-8个，用中文具体名词，描述画面里的关键元素（如"赛里木湖"比"湖泊"好，"天山雪峰"比"雪山"好）
-4. scene_category 必须从上面的分类列表选最匹配的一个
-5. motion_tags 1-3个，描述镜头运动方式（推、拉、平移、环绕、上升、下降、固定、航拍、摇镜等）
-6. quality 严格按上面的评分标准打分
-7. 只返回JSON，不要其他文字，不要markdown代码块"""
+## 要求
+1. 按画面内容和运镜的变化自然分段，每段 3-15 秒，总场景数 2-10 个
+2. start_sec / end_sec / usable_* 精确到 0.1 秒
+3. subjects 3-6 个，严格遵守上面「能不能指出来」的判据
+4. visual_tags 3-8 个中文具体名词（可与 subjects 重叠）
+5. 完全不可用的段落（严重糊、大幅甩镜、误拍地面）也要输出，quality 给低分并在 defects 说明
+6. 只返回 JSON，不要其他文字，不要 markdown 代码块"""
 
     def _parse_result(
         self, text: str, video_path: str, destination: str
@@ -250,12 +277,36 @@ class QwenVLAnalyzer:
         height = int(video_stream.get("height", 0))
         duration = float(probe.get("format", {}).get("duration", 0))
 
-        # 确保 scenes 有 timecode 格式
+        # 规整到受控词表 + 补齐字段，防止脏值进库
+        from tools.common.vocab import (
+            CAMERA_MOTION, MOOD, SCENE_CATEGORY, SHOT_SCALE, TIME_OF_DAY,
+            motion_class, normalize_enum,
+        )
         for scene in result.get("scenes", []):
             if "start" not in scene:
                 scene["start"] = self._seconds_to_timecode(scene.get("start_sec", 0))
             if "end" not in scene:
                 scene["end"] = self._seconds_to_timecode(scene.get("end_sec", 0))
+
+            scene["scene_category"] = normalize_enum(
+                scene.get("scene_category", ""), SCENE_CATEGORY, "other")
+            scene["shot_scale"] = normalize_enum(
+                scene.get("shot_scale", ""), SHOT_SCALE, "")
+            scene["camera_motion"] = normalize_enum(
+                scene.get("camera_motion", ""), CAMERA_MOTION, "")
+            scene["time_of_day"] = normalize_enum(
+                scene.get("time_of_day", ""), TIME_OF_DAY, "unknown")
+            scene["mood"] = normalize_enum(scene.get("mood", ""), MOOD, "neutral")
+            scene["motion_class"] = (
+                motion_class(scene["camera_motion"]) if scene["camera_motion"] else "")
+
+            # 可用区间兜底：模型没给或给反了，退回整段
+            s0, s1 = scene.get("start_sec", 0.0), scene.get("end_sec", 0.0)
+            u0 = float(scene.get("usable_start_sec") or s0)
+            u1 = float(scene.get("usable_end_sec") or s1)
+            if not (s0 <= u0 < u1 <= s1 + 0.01):
+                u0, u1 = s0, s1
+            scene["usable_start_sec"], scene["usable_end_sec"] = u0, u1
 
         result["destination"] = destination or result.get("destination", "")
         result["metadata"] = {

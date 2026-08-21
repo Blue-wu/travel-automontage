@@ -171,106 +171,127 @@ class TravelAssetIngestor:
         self,
         video_path: str,
         destination: str,
-        quality_threshold: float = 0.75,
+        quality_threshold: float = 0.75,   # 保留形参兼容旧调用，新路径不再使用
     ) -> dict:
-        """混合分析策略：本地 CLIP 切分 + 分类 + qwen 精选增强
+        """混合分析策略（已重构）
 
-        流程：
-        1. PySceneDetect 镜头切分（免费）
-        2. 每镜头多帧 CLIP 分类 + 向量化（免费）
-        3. 对 quality > 阈值的精彩场景，抽关键帧用 qwen 生成描述（省 token）
-        4. 质量评分基于 CLIP 置信度 + 场景类型
+        旧流程的问题：主路径是 CLIP 零样本分类 + 类别→关键词查表，
+        一段视频被压成「1 个枚举 + 一组类别同义词」。这一步有损且不可逆，
+        画面里的具体物件（没化完的浮冰、牧民的摩托车）在入库时就丢了。
+        后果是检索粒度过粗、文案抓不出错位手法 —— 同一个根因的两个症状。
 
-        成本：每个视频仅消耗 0-3 次 qwen 图片调用（而非整视频上传）
+        新流程：
+          主路径  VLM 整段分析 → 分段 + 结构化字段（1 次调用/视频，便宜）
+          回退    PySceneDetect + CLIP 分类（仅 VLM 不可用时）
+          之后    本地 CLIP 向量（免费，检索用）+ 本地画质指标（覆盖 quality）
+
+        注意：本次不改动向量来源，仍走与旧路径一致的本地 CLIP，
+        避免把「打标改造」和「向量空间改造」两个变化混在一起而无法归因。
         """
         import logging
         log = logging.getLogger(__name__)
 
-        # Step 1+2: 本地 V2 分析（镜头切分 + CLIP 分类 + 向量化）
-        log.info(f"混合分析 [本地 CLIP]: {Path(video_path).name}")
+        qwen = self.model_client._get_qwen_analyzer()
+        if qwen is not None:
+            log.info(f"结构化打标 [VLM 整段]: {Path(video_path).name}")
+            try:
+                analysis = qwen.analyze_video(video_path, destination=destination)
+            except Exception as e:
+                log.warning(f"  VLM 分析异常，回退本地 CLIP: {e}")
+                analysis = None
+
+            if analysis and analysis.get("scenes"):
+                analysis["destination"] = destination or analysis.get("destination", "")
+                analysis["analysis_method"] = "vlm_structured"
+                n_subj = sum(len(sc.get("subjects") or []) for sc in analysis["scenes"])
+                log.info(
+                    f"  {len(analysis['scenes'])} 个场景，"
+                    f"{n_subj} 个具体物件（错位手法抓手）"
+                )
+                self._attach_local_signals(analysis, video_path)
+                return analysis
+            log.warning("  VLM 未返回可用场景，回退本地 CLIP")
+        else:
+            log.info("  VLM 不可用（无 DASHSCOPE_API_KEY），走本地 CLIP 回退路径")
+
+        # ── 回退：镜头切分 + CLIP 零样本分类（信息量有限，仅保证流程不断）──
         analysis = self.model_client.analyze_video_scenes_v2(
             video_path, use_video_embedding=False
         )
         analysis["destination"] = destination
+        analysis["analysis_method"] = "clip_fallback"
+        self._attach_local_signals(analysis, video_path)
+        return analysis
 
-        scenes = analysis.get("scenes", [])
-        if not scenes:
-            return analysis
+    def _attach_local_signals(self, analysis: dict, video_path: str) -> None:
+        """为每个场景补：本地 CLIP 向量（若缺）+ 画质指标，并重算 quality
 
-        # Step 3: 对精彩场景用 qwen 增强描述
-        highlight_scenes = [
-            (i, s) for i, s in enumerate(scenes)
-            if s.get("quality", 0) >= quality_threshold
-        ]
-
-        if not highlight_scenes:
-            # 没有高质量场景，至少增强 top1
-            highlight_scenes = [max(enumerate(scenes), key=lambda x: x[1].get("quality", 0))]
-
-        log.info(
-            f"  精彩场景 {len(highlight_scenes)}/{len(scenes)} 个，"
-            f"用 qwen 增强描述（省 token 模式）"
-        )
-
-        qwen = self.model_client._get_qwen_analyzer()
-        if qwen is None:
-            log.info("  qwen 不可用，使用纯 CLIP 描述")
-            return analysis
-
-        # 对每个精彩场景抽关键帧用 qwen 生成描述
-        import subprocess
+        画质指标替代原先的关键词加分。原实现用 high_value_keywords 命中数推
+        quality，而那份词表含"震撼""绝美" —— 正是文案规范禁用的套话词，
+        等于系统在奖励套话；且 q = 0.68 + score 把大量场景抬到 0.68-0.92，
+        区分度基本丧失。
+        """
+        import logging
         import tempfile
-        from tools.common.config import CACHE_DIR
+        log = logging.getLogger(__name__)
 
-        frames_dir = CACHE_DIR / "hybrid_frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
+        scenes = analysis.get("scenes") or []
+        if not scenes:
+            return
 
-        for idx, scene in highlight_scenes:
-            start_sec = scene.get("start_sec", 0)
-            end_sec = scene.get("end_sec", 10)
-            mid_sec = (start_sec + end_sec) / 2
+        try:
+            from tools.common.frame_quality import aggregate_metrics, fuse_quality
+            from tools.common.shot_detector import extract_frames_from_shot
+        except Exception as e:
+            log.debug(f"画质模块不可用，跳过: {e}")
+            return
 
-            # 抽关键帧
-            frame_path = str(frames_dir / f"{Path(video_path).stem}_{idx}.jpg")
+        clf = None
+        try:
+            from tools.common.clip_classifier import CLIPZeroShotClassifier
+            if getattr(self.model_client, "_clip_classifier", None) is None:
+                self.model_client._clip_classifier = CLIPZeroShotClassifier()
+            clf = self.model_client._clip_classifier
+        except Exception as e:
+            log.debug(f"CLIP 编码器不可用，向量将由下游回退处理: {e}")
+
+        frames_dir = Path(tempfile.mkdtemp(prefix="signals_"))
+        for sc in scenes:
+            # 在可用区间内抽帧，避开起幅落幅
+            a = float(sc.get("usable_start_sec") or sc.get("start_sec", 0.0))
+            b = float(sc.get("usable_end_sec") or sc.get("end_sec", a + 1.0))
+            if b <= a:
+                b = a + 1.0
             try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-ss", str(mid_sec), "-i", video_path,
-                        "-frames:v", "1", "-q:v", "3",
-                        "-vf", "scale=1280:-1",
-                        frame_path, "-y",
-                    ],
-                    check=True, capture_output=True, timeout=30,
+                frames = extract_frames_from_shot(
+                    video_path, a, b, 4, str(frames_dir)
                 )
-            except Exception as e:
-                log.debug(f"  抽帧失败（场景{idx}）: {e}")
+            except Exception:
+                continue
+            if not frames:
                 continue
 
-            # 用 qwen 分析单张图片（比视频便宜 20-50 倍）
-            try:
-                enhanced = self._qwen_describe_frame(
-                    qwen, frame_path, destination, scene.get("scene_category", "")
-                )
-                if enhanced:
-                    # 合并增强结果（保留 CLIP 的 embedding 和分类，只更新描述和标签）
-                    scene["summary"] = enhanced.get("summary", scene.get("summary", ""))
-                    # 补充更丰富的标签
-                    existing_tags = set(scene.get("visual_tags", []))
-                    new_tags = enhanced.get("visual_tags", [])
-                    scene["visual_tags"] = list(existing_tags | set(new_tags))[:8]
-                    # 更新质量分（qwen 评分更准）
-                    q_quality = enhanced.get("quality")
-                    if q_quality and isinstance(q_quality, (int, float)):
-                        # 取 CLIP 和 qwen 的较高值
-                        scene["quality"] = max(scene.get("quality", 0.5), float(q_quality))
-                    # 补充 dominant_colors
-                    if enhanced.get("dominant_colors"):
-                        scene["dominant_colors"] = enhanced["dominant_colors"]
-                    log.info(f"  场景 {idx} 描述已增强: {scene['summary'][:40]}...")
-            except Exception as e:
-                log.debug(f"  qwen 增强失败（场景{idx}）: {e}")
+            # 画质指标 → 融合 quality
+            m = aggregate_metrics(frames)
+            if m:
+                sc["sharpness"] = m.get("sharpness", 0.0)
+                sc["brightness"] = m.get("brightness", 0.0)
+                sc["exposure_ok"] = m.get("exposure_ok", True)
+            sc["quality"] = fuse_quality(
+                sc.get("quality", 0.5), m, sc.get("defects") or []
+            )
 
-        return analysis
+            # 本地 CLIP 向量（保持与旧路径同一空间）
+            if not sc.get("embedding") and clf is not None:
+                try:
+                    from tools.common.video_feature_extractor import (
+                        aggregate_frame_embeddings,
+                    )
+                    embs = [e for e in (clf.encode_image(f) for f in frames) if e]
+                    if embs:
+                        sc["embedding"] = aggregate_frame_embeddings(embs, method="mean")
+                except Exception as e:
+                    log.debug(f"向量化失败（非致命）: {e}")
 
     def _qwen_describe_frame(
         self,
@@ -551,36 +572,7 @@ quality评分标准：0.9+顶级震撼，0.8优秀，0.7良好，0.6可用，0.5
         }
         if cat in std_cats:
             return cat
-        # visual_tags 中是否包含分类关键词的二次判断在 _enhance_quality 处理
         return "other"
-
-    @staticmethod
-    def _enhance_quality(quality: float, scene: dict) -> float:
-        """根据场景内容微调质量分，避免全是 0.52 的情况"""
-        q = float(quality)
-        # 如果质量分在 0.5-0.55 之间（模型偷懒给的默认值），根据标签推断
-        if 0.5 <= q <= 0.55:
-            tags = [t.lower() for t in scene.get("visual_tags", [])]
-            summary = (scene.get("summary", "") or "").lower()
-            category = scene.get("scene_category", "") or ""
-            cat_text = category.lower()
-
-            # 加分项（顶级/优秀素材特征）
-            high_value_keywords = [
-                "雪山", "雪峰", "日照", "金山", "银河", "星空", "倒影", "镜面",
-                "航拍", "全景", "云海", "震撼", "绝美", "圣湖", "冰川", "峡谷",
-                "日落", "日出", "夕阳", "晨雾", "花海", "牛羊", "草原", "湖泊",
-            ]
-            score = 0.0
-            for kw in high_value_keywords:
-                if any(kw in t for t in tags) or kw in summary or kw in cat_text:
-                    score += 0.05
-            # 标签数量越多，信息越丰富，质量越高
-            score += min(0.08, len(scene.get("visual_tags", [])) * 0.015)
-            q = min(0.92, 0.68 + score)
-
-        # 边界保护
-        return max(0.3, min(0.98, q))
 
     def _build_scenes_with_embeddings(
         self,
@@ -602,23 +594,43 @@ quality评分标准：0.9+顶级震撼，0.8优秀，0.7良好，0.6可用，0.5
             raw_cat = s.get("scene_category", "other")
             normalized_cat = self._normalize_category(raw_cat)
 
-            # 优化质量分
-            raw_quality = float(s.get("quality", 0.7))
-            enhanced_quality = self._enhance_quality(raw_quality, s)
+            # quality 已由 _attach_local_signals 用「VLM 判断 + 本地画质指标」算过，
+            # 不再做关键词加分（原 _enhance_quality 会奖励"震撼""绝美"这类
+            # 文案规范明令禁用的词，且把分布抬到 0.68-0.92 丧失区分度）
+            start_sec = float(s.get("start_sec", 0))
+            end_sec = float(s.get("end_sec", 10))
 
             scene = Scene(
                 start=s.get("start", "00:00:00"),
                 end=s.get("end", "00:00:10"),
-                start_sec=float(s.get("start_sec", 0)),
-                end_sec=float(s.get("end_sec", 10)),
+                start_sec=start_sec,
+                end_sec=end_sec,
                 summary=s.get("summary", ""),
                 visual_tags=s.get("visual_tags", []),
                 scene_category=normalized_cat,
                 motion_tags=s.get("motion_tags", []),
                 audio_tags=s.get("audio_tags", []),
-                quality=enhanced_quality,
+                quality=float(s.get("quality", 0.7)),
                 people_count=int(s.get("people_count", 0)),
                 dominant_colors=s.get("dominant_colors", []),
+                # ── VLM 结构化字段 ──
+                subjects=s.get("subjects", []),
+                shot_scale=s.get("shot_scale", ""),
+                camera_motion=s.get("camera_motion", ""),
+                motion_class=s.get("motion_class", ""),
+                time_of_day=s.get("time_of_day", "unknown"),
+                weather=s.get("weather", "unknown"),
+                mood=s.get("mood", "neutral"),
+                has_person=bool(s.get("has_person", False)),
+                has_speech=bool(s.get("has_speech", False)),
+                ambient_sound=s.get("ambient_sound", []),
+                defects=s.get("defects", []),
+                # ── 本地画质指标 ──
+                sharpness=float(s.get("sharpness", 0.0)),
+                brightness=float(s.get("brightness", 0.0)),
+                exposure_ok=bool(s.get("exposure_ok", True)),
+                usable_start_sec=float(s.get("usable_start_sec") or start_sec),
+                usable_end_sec=float(s.get("usable_end_sec") or end_sec),
             )
 
             # 如果分析结果已包含 embedding，直接用

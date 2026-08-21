@@ -170,6 +170,7 @@ class SemanticAssetRetriever:
             visual_tags = []
 
             scene_category = "other"
+            subjects = []
             if asset and scene_index < len(asset.scenes):
                 scene = asset.scenes[scene_index]
                 quality = scene.quality
@@ -177,6 +178,7 @@ class SemanticAssetRetriever:
                 start_sec = scene.start_sec
                 end_sec = scene.end_sec
                 visual_tags = scene.visual_tags
+                subjects = list(getattr(scene, "subjects", None) or [])
                 scene_category = scene.scene_category
 
             if quality < min_quality:
@@ -207,6 +209,7 @@ class SemanticAssetRetriever:
                 "score": final_score,
                 "scene_summary": summary,
                 "visual_tags": visual_tags,
+                "subjects": subjects,
                 "scene_category": scene_category,
                 "quality": quality,
             })
@@ -286,6 +289,7 @@ class SemanticAssetRetriever:
             start_sec = 0.0
             end_sec = 10.0
             visual_tags = []
+            subjects = []
             scene_category = "other"
 
             if asset and scene_index < len(asset.scenes):
@@ -295,6 +299,7 @@ class SemanticAssetRetriever:
                 start_sec = scene.start_sec
                 end_sec = scene.end_sec
                 visual_tags = scene.visual_tags
+                subjects = list(getattr(scene, "subjects", None) or [])
                 scene_category = scene.scene_category
 
             if quality < min_quality:
@@ -331,6 +336,7 @@ class SemanticAssetRetriever:
                 "score": final_score,
                 "scene_summary": summary,
                 "visual_tags": visual_tags,
+                "subjects": subjects,
                 "scene_category": scene_category,
                 "quality": quality,
             })
@@ -455,6 +461,8 @@ class SemanticAssetRetriever:
                         "score": score,
                         "scene_summary": scene.summary,
                         "visual_tags": scene.visual_tags,
+                    "subjects": list(getattr(scene, "subjects", None) or []),
+                        "subjects": list(getattr(scene, "subjects", None) or []),
                         "quality": scene.quality,
                     })
 
@@ -474,6 +482,8 @@ class SemanticAssetRetriever:
                         "score": 0.0,
                         "scene_summary": scene.summary,
                         "visual_tags": scene.visual_tags,
+                    "subjects": list(getattr(scene, "subjects", None) or []),
+                        "subjects": list(getattr(scene, "subjects", None) or []),
                         "scene_category": scene.scene_category,
                         "quality": scene.quality,
                     })
@@ -525,6 +535,7 @@ class SemanticAssetRetriever:
                     "score": scene.quality,
                     "scene_summary": scene.summary,
                     "visual_tags": scene.visual_tags,
+                    "subjects": list(getattr(scene, "subjects", None) or []),
                     "scene_category": scene.scene_category,
                     "quality": scene.quality,
                 })

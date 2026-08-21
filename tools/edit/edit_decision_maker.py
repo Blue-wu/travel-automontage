@@ -141,7 +141,12 @@ class EditDecisionMaker:
                 narration_text=item.get("script_scene", {}).get("narration", "") if isinstance(item.get("script_scene"), dict) else "",
                 # 画面原料透传给 copywriting stage 做错位抓手
                 visual_summary=matched_clip.get("scene_summary", "") or "",
-                visual_tags=list(matched_clip.get("visual_tags") or []),
+                # subjects 优先：具体物件才是错位手法的抓手，visual_tags 可能是类别同义词
+                visual_tags=list(
+                    matched_clip.get("subjects")
+                    or matched_clip.get("visual_tags")
+                    or []
+                ),
             )
 
             timeline.append(timeline_item)

@@ -9,14 +9,20 @@ from pydantic import BaseModel, Field
 
 
 class Scene(BaseModel):
-    """视频场景"""
+    """视频场景 / 素材单元
+
+    结构化字段由 VLM 打标产出（tools/common/vocab.py 定义受控词表）。
+    scene_category 保留但**降级为附加索引** —— 之前一段视频被压成
+    1 个枚举 + 一组查表词，具体物件信息在入库时就丢了，导致检索粒度
+    过粗、文案抓不出错位手法。
+    """
     start: str = Field(description="起始时间码 HH:MM:SS")
     end: str = Field(description="结束时间码 HH:MM:SS")
     start_sec: float = 0.0
     end_sec: float = 0.0
     summary: str = ""
     visual_tags: list[str] = Field(default_factory=list)
-    scene_category: str = "other"
+    scene_category: str = "other"      # 附加索引，非唯一输出
     motion_tags: list[str] = Field(default_factory=list)
     audio_tags: list[str] = Field(default_factory=list)
     embedding: list[float] | None = None
@@ -24,6 +30,36 @@ class Scene(BaseModel):
     quality: float = 0.0
     people_count: int = 0
     dominant_colors: list[str] = Field(default_factory=list)
+
+    # ── VLM 结构化打标（vocab.py 受控词表）──
+    # subjects 是画面里的具体物件，skills/travel-copywriting.md 手法 A 的抓手：
+    # "湖泊"抓不出手法，"没化完的浮冰"才能抓出"冰敷"
+    subjects: list[str] = Field(default_factory=list)
+    shot_scale: str = ""               # vocab.SHOT_SCALE  景别嵌套约束用
+    camera_motion: str = ""            # vocab.CAMERA_MOTION 动静结合约束用
+    motion_class: str = ""             # static | dynamic（camera_motion 归一）
+    time_of_day: str = "unknown"       # vocab.TIME_OF_DAY
+    weather: str = "unknown"
+    mood: str = "neutral"
+    has_person: bool = False
+    has_speech: bool = False
+    ambient_sound: list[str] = Field(default_factory=list)
+    defects: list[str] = Field(default_factory=list)
+
+    # ── 本地画质指标（frame_quality.py，替代关键词推分）──
+    sharpness: float = 0.0
+    brightness: float = 0.0
+    exposure_ok: bool = True
+
+    # 可用区间：去掉起幅落幅后剪辑真正会用的入出点
+    usable_start_sec: float = 0.0
+    usable_end_sec: float = 0.0
+
+    @property
+    def usable_duration(self) -> float:
+        if self.usable_end_sec > self.usable_start_sec:
+            return self.usable_end_sec - self.usable_start_sec
+        return self.end_sec - self.start_sec
 
 
 class AssetMetadata(BaseModel):
