@@ -361,62 +361,65 @@ class FFmpegComposer:
         timeline: list[TimelineItem],
         font_path: str,
         output_format: OutputFormat | None = None,
+        caption_preset: str = "bold_pop",
+        narration_preset: str = "narration",
     ) -> str:
-        """生成 ASS 格式字幕"""
-        # 基准分辨率（1080x1920 竖屏）
-        base_w, base_h = 1080, 1920
+        """生成 ASS 字幕 —— 委托给样式引擎
+
+        原实现把 ASS 只当纯文本容器：白字 + 硬黑边 + 底部居中 + 整句一次性
+        出现 + 零动画。libass 支持的 \\fad / \\t / \\k / \\blur 一个都没用。
+        现在改由 tools/compose/subtitle_style.py 统一生成，支持：
+          - 预设样式（bold_pop / clean_minimal / karaoke）
+          - 入场动效（弹入 / 淡入）
+          - 双轨：金句轨大字动效 + 旁白轨跟 TTS 逐字点亮
+        """
+        from tools.compose.subtitle_style import build_ass, events_from_timeline
 
         if output_format and output_format.width > 0 and output_format.height > 0:
             play_w, play_h = output_format.width, output_format.height
         else:
-            play_w, play_h = base_w, base_h
+            play_w, play_h = 1080, 1920
 
-        # 字体大小按高度比例缩放
-        scale = play_h / base_h
-        base_font_size = 48
+        events = events_from_timeline(
+            timeline, narration_timings=self._collect_narration_timings(timeline)
+        )
+        return build_ass(
+            events,
+            font_name=self._get_font_name(font_path),
+            play_w=play_w,
+            play_h=play_h,
+            caption_preset=caption_preset,
+            narration_preset=narration_preset,
+        )
 
-        current_time = 0.0
-        events = []
+    def _collect_narration_timings(
+        self, timeline: list[TimelineItem]
+    ) -> dict[int, list[tuple[str, float, float]]]:
+        """取每个镜头旁白的字级时间戳，用于逐字点亮
 
+        时间戳由 TTSSynthesizer 在合成时落盘（与音频同名 .timings.json）。
+        拿不到就返回空，字幕降级为整句淡入，不影响渲染。
+        """
+        out: dict[int, list[tuple[str, float, float]]] = {}
+        try:
+            from tools.audio.tts_synthesizer import TTSSynthesizer
+        except Exception:
+            return out
+
+        tts = None
         for item in timeline:
-            if not item.subtitle:
-                current_time += item.duration_sec
+            vo = getattr(item, "voiceover_path", "") or ""
+            if not vo:
                 continue
-
-            start = current_time
-            end = current_time + item.duration_sec
-
-            start_str = self._seconds_to_ass_time(start)
-            end_str = self._seconds_to_ass_time(end)
-
-            style = item.subtitle_style or {}
-            font_size = int(style.get("font_size", base_font_size) * scale)
-
-            events.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{item.subtitle}"
-            )
-
-            current_time += item.duration_sec
-
-        font_name = self._get_font_name(font_path)
-        outline = max(2, int(3 * scale))
-        margin_v = int(80 * scale)
-
-        ass_header = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {play_w}
-PlayResY: {play_h}
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},1,2,10,10,{margin_v},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-        return ass_header + "\n".join(events) + "\n"
+            try:
+                if tts is None:
+                    tts = TTSSynthesizer()
+                wt = tts.get_word_timings(vo)
+                if wt:
+                    out[item.order] = wt
+            except Exception as e:
+                logger.debug(f"取字级时间戳失败（镜头{item.order}）: {e}")
+        return out
 
     @staticmethod
     def _seconds_to_ass_time(seconds: float) -> str:

@@ -226,6 +226,8 @@ class TimelineItem(BaseModel):
     # "湖泊"抓不出手法，"没化完的浮冰"才能抓出"冰敷"。
     visual_summary: str = ""
     visual_tags: list[str] = Field(default_factory=list)
+    # 该镜头旁白音频路径；同名 .timings.json 存字级时间戳，驱动 ASS 逐字点亮
+    voiceover_path: str = ""
 
 
 class BgmConfig(BaseModel):
