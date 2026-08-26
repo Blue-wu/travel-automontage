@@ -4,8 +4,8 @@
 
 pipeline:
   name: travel-vlog
-  description: "单目的地旅行叙事 Vlog，30-60秒，适配抖音竖屏"
-  version: "1.0"
+  description: "单目的地旅行叙事 Vlog，30-60秒，适配抖音竖屏。支持多风格：humor/real/contrast"
+  version: "2.0"
 
   # 全局变量，可被 stages 中的 {{var}} 引用
   variables:
@@ -17,6 +17,19 @@ pipeline:
     aspect_ratio: "original"  # original = 保持原素材比例
     resolution: "original"    # original = 保持原素材分辨率
     fps: 0  # 0 = 保持原素材帧率
+    # ── 多风格注入（由 CLI --styles 循环覆盖）──
+    style: ""
+    style_label: ""
+    persona: "克制、不煽情、像跟朋友讲事"
+    narrative: ""
+    avoid_words: ""
+    hook_priority: ""
+    device_priority: ""
+    tts_voice: "yunjian"
+    tts_rate: "-5%"
+    # 运行前缀（区分输出文件名/配音目录），默认空则原行为
+    run_prefix: ""
+    vo_suffix: ""
 
   stages:
     # ── Stage 1: 趋势研究 ──
@@ -27,7 +40,7 @@ pipeline:
       input:
         niche: "旅行"
         destination: "{{destination}}"
-      output: trend_report.json
+      output: trend_report{{run_prefix}}.json
       output_schema: schemas/trend_report.schema.json
       on_failure: "warn"  # 趋势分析失败不阻塞，用默认 hooks
 
@@ -38,21 +51,24 @@ pipeline:
       input:
         destination: "{{destination}}"
         min_quality: 0.0
-      output: candidate_clips.json
+      output: candidate_clips{{run_prefix}}.json
       output_schema: schemas/candidate_clips.schema.json
       on_failure: "fatal"
 
     # ── Stage 3: 剧本生成 ──
-    # 结合趋势 + 素材，生成创意剧本
+    # 结合趋势 + 素材，生成创意剧本（带风格会影响 hook_type 偏好）
     - name: script_generation
       tool: tools.edit.script_generator.ScriptGenerator.generate
       skill: skills/travel-storytelling.md
       input:
-        trend: "{{trend_report}}"
-        clips: "{{candidate_clips}}"
+        trend: "trend_report{{run_prefix}}"
+        clips: "candidate_clips{{run_prefix}}"
         destination: "{{destination}}"
         duration: "{{duration}}"
-      output: script.json
+        style: "{{style}}"
+        hook_priority: "{{hook_priority}}"
+        narrative: "{{narrative}}"
+      output: script{{run_prefix}}.json
       output_schema: schemas/script.schema.json
       depends_on: [trend_research, asset_retrieval]
       on_failure: "fatal"
@@ -63,21 +79,23 @@ pipeline:
       tool: tools.edit.storyboard_planner.StoryboardPlanner.plan
       skill: skills/travel-pacing.md
       input:
-        script: "{{script}}"
-        candidate_clips: "{{candidate_clips}}"
-      output: storyboard.json
+        script: "script{{run_prefix}}"
+        candidate_clips: "candidate_clips{{run_prefix}}"
+        style: "{{style}}"
+      output: storyboard{{run_prefix}}.json
       depends_on: [script_generation]
       on_failure: "fatal"
 
     # ── Stage 4.5: 配音生成 ──
-    # 将剧本旁白合成为中文语音
+    # 将剧本旁白合成为中文语音（临时版，copywriting 后会重新生成）
     - name: voiceover_generation
       tool: tools.audio.voiceover_generator.VoiceoverGenerator.generate
       input:
-        script: "{{script}}"
-        output_dir: "data/output/voiceover_{{destination}}"
-        voice: "yunxi"  # 云希（年轻男声）
-      output: voiceover.json
+        script: "script{{run_prefix}}"
+        output_dir: "data/output/voiceover_{{destination}}{{run_prefix}}"
+        voice: "{{tts_voice}}"
+        rate: "{{tts_rate}}"
+      output: voiceover{{run_prefix}}.json
       depends_on: [script_generation]
       on_failure: "warn"  # 配音失败不阻塞，继续生成无声视频
 
@@ -87,46 +105,64 @@ pipeline:
       tool: tools.edit.edit_decision_maker.EditDecisionMaker.decide
       skill: skills/travel-pacing.md
       input:
-        storyboard: "{{storyboard}}"
-        voiceover: "{{voiceover}}"
+        storyboard: "storyboard{{run_prefix}}"
+        voiceover: "voiceover{{run_prefix}}"
         output_format:
-          width: 0     # 0 = 保持原素材宽度
+          width: 0     # 0 = 保持原素材宽度 (4K)
           height: 0    # 0 = 保持原素材高度
           fps: 0       # 0 = 保持原素材帧率
-      output: edit_decision.json
+      output: edit_decision{{run_prefix}}.json
       output_schema: schemas/edit_decision.schema.json
       depends_on: [storyboard, voiceover_generation]
       on_failure: "fatal"
 
     # ── Stage 5.5: 文案生成 ★ ──
-    # 时间线定稿后，由 LLM 一次性生成整条片子的全部字幕。
-    # 必须在 edit_decision 之后：字幕要卡镜头时长、要首尾呼应、时序不能矛盾，
-    # 这些只有时间线确定后才有完整上下文。
-    # 逐镜头独立生成（旧 script_generator 的 random.choice）结构上产生不了呼应。
+    # 时间线定稿后，由 LLM 一次性生成整条片子的全部字幕和配音文案。
+    # persona / avoid_words / style 由多风格循环注入。
     - name: copywriting
       tool: tools.edit.copywriter.Copywriter.write
       skill: skills/travel-copywriting.md
       input:
-        edit_decision: "{{edit_decision}}"
+        edit_decision: "edit_decision{{run_prefix}}"
         brief:
           destination: "{{destination}}"
           # ★ 活人感的唯一来源，必须由创作者填写真实经历，见 skill §6
           trip_context: "{{trip_context}}"
-          persona: "克制、不煽情、像跟朋友讲事"
-        trip_facts: "{{trip_facts}}"
-      output: edit_decision_copy.json
+          style: "{{style}}"
+          persona: "{{persona}}"
+          avoid: "{{avoid_words}}"
+          device_priority: "{{device_priority}}"
+      output: edit_decision_copy{{run_prefix}}.json
       depends_on: [edit_decision]
       on_failure: "warn"   # 文案失败不阻塞渲染，退回模板字幕
+
+    # ── Stage 5.6: 配音重新生成 ★ ──
+    # copywriting 阶段重新生成了 narration_text，需要重新合成配音。
+    - name: voiceover_regeneration
+      tool: tools.audio.voiceover_generator.VoiceoverGenerator.regenerate
+      input:
+        edit_decision: "edit_decision_copy{{run_prefix}}"
+        # ★ 属性访问保留嵌套写法（返回字符串，经 str() 转换安全）
+        hook_text: "{{script{{run_prefix}}.hook.text}}"
+        output_dir: "data/output/voiceover_{{destination}}{{run_prefix}}"
+        voice: "{{tts_voice}}"
+        rate: "{{tts_rate}}"
+      output: voiceover_copy{{run_prefix}}.json
+      depends_on: [copywriting]
+      on_failure: "warn"  # 失败不阻塞，用旧配音
 
     # ── Stage 6: 渲染合成 ──
     - name: compose
       tool: tools.compose.ffmpeg_composer.FFmpegComposer.compose
       skill: agents_skills/ffmpeg.md
       input:
-        edit_decision: "{{edit_decision_copy}}"
-        output_path: "data/output/final_{{destination}}.mp4"
-      output: final_video.mp4
-      depends_on: [copywriting]
+        edit_decision: "edit_decision_copy{{run_prefix}}"
+        # ★ 必须显式传入 regenerate 后的新配音（含 segments 时长元数据），
+        #   用于 Bottom 字幕与配音逐段同步（单一真源）。
+        voiceover: "voiceover_copy{{run_prefix}}"
+        output_path: "data/output/final_{{destination}}{{run_prefix}}.mp4"
+      output: final_video{{run_prefix}}.mp4
+      depends_on: [voiceover_regeneration]
       on_failure: "fatal"
 
     # ── Stage 7: 质量自检 ──
@@ -134,9 +170,9 @@ pipeline:
       tool: tools.qa.quality_reviewer.QualityReviewer.review
       skill: skills/douyin-travel-format.md
       input:
-        video_path: "{{final_video}}"
-        edit_decision: "{{edit_decision}}"
-      output: qa_review.json
+        video_path: "final_video{{run_prefix}}"
+        edit_decision: "edit_decision{{run_prefix}}"
+      output: qa_review{{run_prefix}}.json
       output_schema: schemas/qa_review.schema.json
       gates:
         - slideshow_risk_check    # 防止"假视频"（静态图片轮播）

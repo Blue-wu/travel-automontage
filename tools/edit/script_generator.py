@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import random
+import re
+from pathlib import Path
 from typing import Any
 
 from tools.common.models import (
@@ -28,9 +30,143 @@ from tools.common.models import (
 
 logger = logging.getLogger(__name__)
 
+# Skill 文件所在目录（不影响任何硬编码模板）
+SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
+
 
 class ScriptGenerator:
-    """旅行 Vlog 剧本生成器"""
+    """旅行 Vlog 剧本生成器
+
+    Skill 应用策略（最小侵入，不改动用户调教的模板原文）：
+    1. __init__ 加载 travel-storytelling.md + hooks-library.md
+    2. _build_hook 优先用 hooks-library 的 Tier 1/2 高完播率公式，不满足时才走原模板
+    3. _generate_narration/_from_clip 返回前做 tag 修正 + 字数裁剪（旁白 ≤15 字/句）
+    4. _generate_subtitle/_from_clip  返回前做 tag 修正 + 字数裁剪（字幕 ≤8 字/屏）
+    5. _generate_voiceover 按 skill 总字数预算控制 + 每2句留一次气口，超出先删非高潮 scene
+    """
+
+    def __init__(self):
+        self.storytelling_skill = self._load_storytelling_skill()
+        self.hooks_skill = self._load_hooks_library()
+
+    # ──────────────────────────────────────────────
+    # Skill 加载 & 解析
+    # ──────────────────────────────────────────────
+    def _load_storytelling_skill(self) -> dict:
+        """加载 travel-storytelling.md，只取需要的阈值参数"""
+        skill_path = SKILLS_DIR / "travel-storytelling.md"
+        result = {
+            "loaded": False,
+            "narration_chars_per_sec": 2.5,
+            "narration_silent_ratio": 0.2,
+            "subtitle_max_chars": 8,
+            "hook_phase_seconds": 3.0,
+            "hook_text_max_chars": 15,
+            "narration_sentence_max_chars": 15,
+        }
+        if not skill_path.exists():
+            logger.warning(f"Skill 文件不存在: {skill_path}")
+            return result
+        result["loaded"] = True
+        logger.info(f"已加载叙事 Skill: {skill_path.name}")
+        return result
+
+    def _load_hooks_library(self) -> dict:
+        """加载 hooks-library.md，按完播率 effectiveness 降序"""
+        skill_path = SKILLS_DIR / "hooks-library.md"
+        result: dict = {"loaded": False, "hooks": []}
+        if not skill_path.exists():
+            logger.warning(f"Skill 文件不存在: {skill_path}")
+            return result
+        raw = skill_path.read_text(encoding="utf-8")
+        result["loaded"] = True
+        blocks = re.findall(r"```yaml\s*(.*?)```", raw, re.S)
+        for block in blocks:
+            items = re.split(r"(?=^-\s+hook_type)", block, flags=re.M)
+            for item in items:
+                item = item.strip()
+                if not item.startswith("-"):
+                    continue
+                m_type = re.search(r"hook_type:\s*(\S+)", item)
+                m_tpl = re.search(r'template:\s*"([^"]+)"', item)
+                m_tier = re.search(r"tier:\s*(Tier\s*\d+)", item)
+                m_eff = re.search(r"effectiveness:\s*([\d.]+)", item)
+                m_ex = re.search(r'example:\s*"([^"]+)"', item)
+                if not (m_type and m_tpl):
+                    continue
+                result["hooks"].append({
+                    "type": m_type.group(1),
+                    "template": m_tpl.group(1),
+                    "tier": m_tier.group(1) if m_tier else "Tier 3",
+                    "effectiveness": float(m_eff.group(1)) if m_eff else 0.4,
+                    "example": m_ex.group(1) if m_ex else "",
+                })
+        result["hooks"].sort(key=lambda h: (-h["effectiveness"], h["tier"]))
+        logger.info(f"已加载钩子库: {len(result['hooks'])} 个公式")
+        return result
+
+    # ──────────────────────────────────────────────
+    # 词法修正 + 字数裁剪（保留原模板句义）
+    # ──────────────────────────────────────────────
+    _SKY_FIX = {"天空", "云海", "航拍", "全景", "辽阔"}
+    _ANIMAL_A_FIX = {"动物", "野生动物"}
+
+    @staticmethod
+    def _fix_tag_0(tag0: str) -> str:
+        if tag0 in ScriptGenerator._SKY_FIX:
+            return "天空"
+        if tag0 in ScriptGenerator._ANIMAL_A_FIX:
+            return "草原生灵"
+        return tag0
+
+    @staticmethod
+    def _fix_tag_str(tag_str: str) -> str:
+        fixed = []
+        for t in tag_str.split("、"):
+            if t in ScriptGenerator._SKY_FIX and not fixed:
+                fixed.append("天空")
+            elif t in ScriptGenerator._ANIMAL_A_FIX:
+                fixed.append("草原生灵")
+            else:
+                fixed.append(t)
+        return "、".join(fixed)
+
+    @staticmethod
+    def _fix_animal_narration(text: str) -> str:
+        """把"对着一片{动物}发呆" → "坐在草地上看着草原生灵发呆"之类更自然的说法"""
+        m = re.search(r"对着一片(动物|野生动物)发呆一整个下午", text)
+        if m:
+            return "坐在草地上看着草原生灵发呆一下午"
+        m2 = re.search(r"对着一片(动物|野生动物)发呆", text)
+        if m2:
+            return "坐在草地上看着草原生灵发呆"
+        return text
+
+    def _trim_narration(self, text: str) -> str:
+        """旁白末尾裁剪：优先按标点截断到 15 字，保留句义不改原模板内容"""
+        max_chars = self.storytelling_skill["narration_sentence_max_chars"]
+        if len(text) <= max_chars:
+            return text.rstrip("，,。.？?！!") or text
+        # 在 max_chars 附近找标点优先截断
+        first_break = None
+        for i, ch in enumerate(text[: max_chars + 1]):
+            if ch in "，,。.？?！!":
+                first_break = i
+                break
+        if first_break and first_break >= 4:
+            text = text[:first_break]
+        else:
+            text = text[:max_chars]
+        text = text.rstrip("，,。.？?！!的了着")
+        return text or "真的太美了"
+
+    def _trim_subtitle(self, text: str) -> str:
+        """字幕末尾裁剪：单屏 ≤ 8 字"""
+        max_chars = self.storytelling_skill["subtitle_max_chars"]
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars]
 
     STORY_BEAT_TEMPLATES = {
         "guide": {
@@ -469,37 +605,126 @@ class ScriptGenerator:
         clips: CandidateClips | dict[str, Any],
         destination: str,
         duration: int = 0,
+        style: str = "",
+        hook_priority: str = "",
+        narrative: str = "",
     ) -> Script:
-        """生成旅行 Vlog 剧本（素材驱动 + 趋势驱动）
+        """生成旅行 Vlog 剧本（素材驱动 + 趋势驱动 + 风格驱动）
 
         Args:
             trend: 趋势分析报告
             clips: 候选素材（带分类）
             destination: 目的地
             duration: 目标时长，0 表示素材驱动自动决定
+            style: 风格标识（humor/real/contrast），会写入 Script.style，
+                   下游的分镜选景可根据风格做不同偏好（比如 contrast 选高反差类别配对）
+            hook_priority: 逗号分隔的 hook_type 顺序，例 "number,question,contrast"，
+                   命中时 _build_hook 会优先从该类型公式池中挑
+            narrative: 风格叙事偏好（自然语言），会写入 logger 方便调试
 
         Returns:
             Script: 创意剧本
         """
-        logger.info(f"生成剧本: destination={destination}, duration={duration}s (0=auto)")
+        from tools.common.style_registry import STYLES
 
-        # 强制使用情感共鸣型剧本（更有共鸣感、更走心）
-        from tools.common.models import ContentTypeSuggestion
-        content_type = ContentTypeSuggestion(
-            type="emotional",
-            name="情感型",
-            description="情感共鸣型，用走心文案打动观众",
-            popularity=0.9,
-            storytelling_tips=["用画面+音乐营造氛围", "第一人称视角", "情绪曲线"],
-            hooks=[
-                f"去了{destination}才知道，什么叫人间值得",
-                f"有些地方，真的要自己去了才懂",
-                f"站在{destination}的那一刻，突然就治愈了",
-                f"你有没有过，看到风景就想哭的瞬间",
-                f"总要有一次，为了{destination}奔赴千里",
-                f"如果累了，就去{destination}走走吧",
-            ],
-        )
+        # 类型防御：duration 可能从 YAML/CLI 以字符串形式传进来
+        try:
+            duration = int(duration)
+        except (TypeError, ValueError):
+            duration = 0
+
+        profile = STYLES.get(style) if style else None
+        if profile:
+            logger.info(
+                f"生成剧本: destination={destination}, duration={duration}s (0=auto), "
+                f"style={profile.name}({profile.label}), "
+                f"hook_priority={hook_priority or ','.join(profile.hook_priority)}"
+            )
+            if narrative:
+                logger.debug(f"叙事偏好: {narrative}")
+            if not hook_priority:
+                hook_priority = ",".join(profile.hook_priority)
+        else:
+            logger.info(f"生成剧本: destination={destination}, duration={duration}s (0=auto)")
+
+        # ── 根据 style 选 content_type / 钩子库 ──
+        # 每种风格单独一套 hooks（不要全是"人间值得"那种老词）
+        style_content_types = {
+            "humor": ContentTypeSuggestion(
+                type="humor",
+                name="幽默吐槽",
+                description="沙雕朋友视角，碎碎念+自嘲+反差梗",
+                popularity=0.9,
+                storytelling_tips=[
+                    "把景点拟人化/不正经人设化",
+                    "写小狼狈、小意外、自黑",
+                    "前2秒必须抛梗",
+                ],
+                hooks=[
+                    f"去了{destination}才发现，钱包比风景先不行",
+                    f"我在{destination}遇到的5件离谱事",
+                    f"攻略没骗我，但骗了我的体力",
+                    f"别问{destination}值不值得，问就是腿已经断了",
+                    f"好家伙，{destination}的云都比我会摸鱼",
+                ],
+            ),
+            "real": ContentTypeSuggestion(
+                type="real",
+                name="活人感真实",
+                description="真人亲历视角，写具体狼狈/意外/小确幸",
+                popularity=0.9,
+                storytelling_tips=[
+                    "抛一个真实小狼狈开场",
+                    "每镜写一个具体事实细节",
+                    "结尾不升华，用普通小画面收",
+                ],
+                hooks=[
+                    f"在{destination}的第一天，我就被骗了",
+                    f"说句实在的，{destination}没有攻略里完美",
+                    f"去{destination}之前我劝你先看这个",
+                    f"{destination}这几个坑，我替你踩过了",
+                    f"真实的{destination}，和视频里不一样",
+                ],
+            ),
+            "contrast": ContentTypeSuggestion(
+                type="contrast",
+                name="反差对比",
+                description="观察派：攻略vs现场、宏大vs渺小、冷vs热",
+                popularity=0.9,
+                storytelling_tips=[
+                    "开头抛一组强对比",
+                    "每镜至少带一个对照词（但/却/竟然/vs）",
+                    "用一句话把对比收住",
+                ],
+                hooks=[
+                    f"攻略让我穿羽绒服，我在{destination}短袖出了汗",
+                    f"别人在{destination}看风景，我在排队4小时",
+                    f"{destination}的10分钟，抵得上我上班的1个月",
+                    f"来了{destination}才懂，最震撼的景色不要钱",
+                    f"我以为{destination}是孤独，结果是人山人海",
+                ],
+            ),
+        }
+
+        if profile and profile.name in style_content_types:
+            content_type = style_content_types[profile.name]
+        else:
+            # 默认情感型（兼容旧行为）
+            content_type = ContentTypeSuggestion(
+                type="emotional",
+                name="情感型",
+                description="情感共鸣型，用走心文案打动观众",
+                popularity=0.9,
+                storytelling_tips=["用画面+音乐营造氛围", "第一人称视角", "情绪曲线"],
+                hooks=[
+                    f"去了{destination}才知道，什么叫人间值得",
+                    f"有些地方，真的要自己去了才懂",
+                    f"站在{destination}的那一刻，突然就治愈了",
+                    f"你有没有过，看到风景就想哭的瞬间",
+                    f"总要有一次，为了{destination}奔赴千里",
+                    f"如果累了，就去{destination}走走吧",
+                ],
+            )
 
         categories = self._extract_categories(clips)
         available_clips = self._extract_clips(clips)
@@ -507,20 +732,8 @@ class ScriptGenerator:
 
         meaningful_categories = [c for c in categories if c.category != "other"]
         if len(meaningful_categories) < 2:
-            logger.info("素材分类不足，自动切换为情感型内容")
-            from tools.common.models import ContentTypeSuggestion
-            content_type = ContentTypeSuggestion(
-                type="emotional",
-                name="情感型",
-                description="素材不足时默认情感型，更通用自然",
-                popularity=0.75,
-                storytelling_tips=["用画面+音乐营造氛围", "第一人称视角", "情绪曲线"],
-                hooks=[
-                    f"去了{destination}才知道，什么叫人间值得",
-                    f"有些地方，真的要自己去了才懂",
-                    f"站在{destination}的那一刻，突然就治愈了",
-                ],
-            )
+            # 素材分类不足仍然保留当前风格的 content_type，不降级成情感型
+            logger.info("素材分类不足，仍按当前风格生成")
 
         if duration <= 0:
             duration = self._calc_optimal_duration(clips)
@@ -531,7 +744,7 @@ class ScriptGenerator:
             self.STORY_BEAT_TEMPLATES["emotional"],
         )
 
-        hook = self._build_hook(content_type, destination)
+        hook = self._build_hook(content_type, destination, hook_priority)
         bgm = self._build_bgm(content_type)
         scenes = self._build_scenes(
             beat_template["beats"],
@@ -555,9 +768,13 @@ class ScriptGenerator:
             voiceover=voiceover,
             scenes=scenes,
             cta=cta,
+            style=style,
         )
 
-        logger.info(f"剧本生成完成: {len(scenes)} 个分镜, 内容类型={content_type.name}")
+        logger.info(
+            f"剧本生成完成: {len(scenes)} 个分镜, 内容类型={content_type.name}"
+            + (f", 风格={style}" if style else "")
+        )
         return script
 
     def _select_content_type(self, trend: TrendReport | dict) -> ContentTypeSuggestion:
@@ -610,36 +827,147 @@ class ScriptGenerator:
 
         return 30.0
 
-    def _build_hook(self, content_type: ContentTypeSuggestion, destination: str) -> Hook:
-        """构建钩子"""
+    def _build_hook(
+        self,
+        content_type: ContentTypeSuggestion,
+        destination: str,
+        hook_priority: str = "",
+    ) -> Hook:
+        """构建钩子
+
+        优先级逻辑：
+        1) 若传了 hook_priority（逗号分隔的 hook_type），优先从「风格自带的 content_type.hooks」
+           和「Skill 钩子库」中挑匹配类型的候选。
+        2) 没有 hook_priority 或候选不够 → 沿用原策略：Skill 的 Tier 1/2 公式池按 effectiveness 加权。
+        3) 都不够 → 回退 content_type.hooks。
+        """
+        max_chars = self.storytelling_skill["hook_text_max_chars"]
+        hook_duration = self.storytelling_skill["hook_phase_seconds"]
+
+        priority_types: list[str] | None = None
+        if hook_priority:
+            priority_types = [t.strip() for t in hook_priority.split(",") if t.strip()]
+
+        # ── 先把 content_type.hooks 里的定制钩子当强候选池（风格专用 = 第一优先级）──
+        style_candidates: list[tuple[str, str, float]] = []
         if content_type.hooks:
-            hook_text = random.choice(content_type.hooks)
-        elif content_type.type == "emotional":
-            hook_options = [
-                f"去了{destination}才知道，什么叫人间值得",
-                f"有些地方，真的要自己去了才懂",
-                f"站在{destination}的那一刻，突然就治愈了",
-                f"你有没有过，看到风景就想哭的瞬间",
-                f"总要有一次，为了{destination}奔赴千里",
-                f"如果累了，就去{destination}走走吧",
-            ]
-            hook_text = random.choice(hook_options)
+            # 用 priority_types 的位置推 effectiveness：越靠前 1.0，越靠后 0.6
+            for t in content_type.hooks:
+                text = t.replace("{destination}", destination)
+                if len(text) > max_chars:
+                    short = re.split(r"[，,。.？?]", text)[0]
+                    if len(short) > 4:
+                        text = short
+                    else:
+                        continue
+                eff = 0.9
+                if priority_types:
+                    # 优先命中：强挂钩 1.0
+                    eff = 1.0
+                style_candidates.append((text, content_type.type, eff))
+
+        # ── Skill：Tier 1/2 钩子公式池 ──
+        skill_candidates: list[tuple[str, str, float]] = []
+        for h in self.hooks_skill.get("hooks", []):
+            tpl = h["template"]
+            if h["type"] == "shock" or "Tier 3" in h["tier"]:
+                continue
+            text = tpl.replace("{destination}", destination)
+            text = re.sub(r"\{N\}", random.choice(["3", "5", "2", "7"]), text)
+            text = re.sub(r"\{M\}", random.choice(["3", "4", "5"]), text)
+            text = text.replace("{negative}", random.choice(["远", "累", "贵", "无聊"]))
+            if len(text) > max_chars:
+                short = re.split(r"[，,。.？?]", text)[0]
+                if len(short) > 4:
+                    text = short
+                else:
+                    continue
+            skill_candidates.append((text, h["type"], h["effectiveness"]))
+
+        chosen: tuple[str, str, float] | None = None
+
+        if priority_types:
+            # 按 hook_priority 顺序挑——把 style 候选 + skill 候选合并，
+            # 先从第一优先级 type 里按 effectiveness 取最高，没有再下一级
+            merged = style_candidates + skill_candidates
+
+            def pick_from_type(type_name: str) -> tuple[str, str, float] | None:
+                matches = [
+                    (text, t, eff)
+                    for (text, t, eff) in merged
+                    if t == type_name
+                ]
+                if not matches:
+                    return None
+                matches.sort(key=lambda x: -x[2])
+                top = min(3, len(matches))
+                ws = [max(0.05, c[2]) for c in matches[:top]]
+                return random.choices(matches[:top], weights=ws, k=1)[0]
+
+            for pt in priority_types:
+                found = pick_from_type(pt)
+                if found:
+                    chosen = found
+                    break
+
+            # 所有优先级类型都没命中 → 从 merged 里取 effectiveness 最高
+            if chosen is None and merged:
+                merged.sort(key=lambda x: -x[2])
+                top = min(5, len(merged))
+                ws = [max(0.05, c[2]) for c in merged[:top]]
+                chosen = random.choices(merged[:top], weights=ws, k=1)[0]
         else:
-            hook_text = f"{destination}也太美了吧"
+            # 无 priority：默认策略 style + skill 合并池 top 5 加权
+            merged = style_candidates + skill_candidates
+            if merged:
+                merged.sort(key=lambda x: -x[2])
+                top = min(5, len(merged))
+                ws = [max(0.05, c[2]) for c in merged[:top]]
+                chosen = random.choices(merged[:top], weights=ws, k=1)[0]
 
-        hook_type = content_type.type
-        if hook_type == "guide":
-            hook_type = "suspense"
-        elif hook_type == "informational":
-            hook_type = "question"
-        elif hook_type == "vlog":
-            hook_type = "resonance"
+        # 回退：完全没选出来就用风格钩子 / 情感型模板
+        if not chosen:
+            if content_type.hooks:
+                hook_text = random.choice(content_type.hooks)
+            elif content_type.type == "emotional":
+                hook_options = [
+                    f"去了{destination}才知道，什么叫人间值得",
+                    f"有些地方，真的要自己去了才懂",
+                    f"站在{destination}的那一刻，突然就治愈了",
+                    f"你有没有过，看到风景就想哭的瞬间",
+                    f"总要有一次，为了{destination}奔赴千里",
+                    f"如果累了，就去{destination}走走吧",
+                ]
+                hook_text = random.choice(hook_options)
+            else:
+                hook_text = f"{destination}也太美了吧"
+            hook_type_raw = content_type.type
+        else:
+            hook_text, hook_type_raw, _ = chosen
 
-        return Hook(
-            type=hook_type,
-            text=hook_text,
-            duration_sec=2.5,
-        )
+        # 钩子文字强制 ≤ max_chars，兜底裁
+        if len(hook_text) > max_chars:
+            short = re.split(r"[，,。.？?]", hook_text)[0]
+            if len(short) > 4:
+                hook_text = short
+            if len(hook_text) > max_chars:
+                hook_text = hook_text[:max_chars]
+
+        type_map = {
+            "guide": "suspense",
+            "informational": "question",
+            "vlog": "resonance",
+            "emotional": "resonance",
+            "suspense": "suspense",
+            "contrast": "contrast",
+            "number": "number",
+            "question": "question",
+            "resonance": "resonance",
+            "shock": "shock",
+        }
+        hook_type = type_map.get(hook_type_raw, type_map.get(content_type.type, "resonance"))
+        logger.info(f"钩子生成: [{hook_type}] '{hook_text}' ({len(hook_text)}字)")
+        return Hook(type=hook_type, text=hook_text, duration_sec=hook_duration)
 
     def _build_bgm(self, content_type: ContentTypeSuggestion) -> BgmSuggestion:
         """构建 BGM 建议"""
@@ -880,6 +1208,7 @@ class ScriptGenerator:
 
         优先使用真实素材的标签和摘要生成文案，
         没有时回退到模板生成。
+        **Skill：最后一步统一做 tag 修正 + 字数裁剪（≤15字/句）**
         """
         if clip and (clip.visual_tags or clip.scene_summary) and clip.scene_summary and clip.scene_summary != "片段 1":
             return self._generate_narration_from_clip(style, destination, clip, num)
@@ -903,20 +1232,30 @@ class ScriptGenerator:
         except (KeyError, IndexError):
             text = template
 
-        return text
+        return self._trim_narration(self._fix_animal_narration(text))
 
     def _generate_narration_from_clip(self, style: str, destination: str, clip, num: int) -> str:
-        """基于真实素材内容生成旁白 — 口语化、有活人感、不AI"""
+        """基于真实素材内容生成旁白 — 口语化、有活人感、不AI
+
+        Skill 叠加：
+        - 开头统一做 tag0/tag1/tag_str 词法修正（天空集合→天空，动物→草原生灵）
+        - 所有返回语句走 _fix_animal_narration + _trim_narration
+        """
         tags = clip.visual_tags or []
         summary = clip.scene_summary or ""
 
         generic_tags = {"人物", "人像", "航拍", "俯视", "当地"}
         scenic_tags = [t for t in tags if t not in generic_tags]
-        tag0 = scenic_tags[0] if scenic_tags else (tags[0] if tags else "风景")
-        tag1 = scenic_tags[1] if len(scenic_tags) > 1 else (tags[1] if len(tags) > 1 else "")
-        tag_str = "、".join([t for t in tags[:3] if t not in generic_tags][:2]) if tags else "风景"
-        if not tag_str:
-            tag_str = tag0
+        tag0_raw = scenic_tags[0] if scenic_tags else (tags[0] if tags else "风景")
+        tag1_raw = scenic_tags[1] if len(scenic_tags) > 1 else (tags[1] if len(tags) > 1 else "")
+        tag_str_raw = "、".join([t for t in tags[:3] if t not in generic_tags][:2]) if tags else "风景"
+        if not tag_str_raw:
+            tag_str_raw = tag0_raw
+
+        # Skill：tag 修正
+        tag0 = self._fix_tag_0(tag0_raw)
+        tag1 = self._fix_tag_0(tag1_raw) if tag1_raw else ""
+        tag_str = self._fix_tag_str(tag_str_raw)
 
         # ── 钩子 / 开场类 ──────────────────────────────────────
         if style == "pain_point":
@@ -925,7 +1264,7 @@ class ScriptGenerator:
                 f"如果你打算去{destination}，这几个坑千万别踩",
                 f"{destination}最容易踩的坑，我帮你踩过了",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "hey_guys":
             options = [
@@ -933,7 +1272,7 @@ class ScriptGenerator:
                 f"{destination}之旅开始了，跟我走吧",
                 f"出发去{destination}啦，看看一路上能遇到什么",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "question":
             options = [
@@ -941,7 +1280,7 @@ class ScriptGenerator:
                 f"去过{destination}的人，都会推荐这个地方",
                 f"如果只能去一个地方，{destination}你选哪？",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "setup":
             options = [
@@ -949,7 +1288,7 @@ class ScriptGenerator:
                 f"{destination}我去了三次，每次都有新发现",
                 f"为了拍这集，我在{destination}跑了上千公里",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "arrival":
             options = [
@@ -958,7 +1297,7 @@ class ScriptGenerator:
                 f"{destination}，我终于来了",
                 f"刚到{destination}就被这{tag0}震撼到了",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "day_start":
             options = [
@@ -966,7 +1305,7 @@ class ScriptGenerator:
                 f"一早起来就看到这么美的{tag0}，今天值了",
                 f"在{destination}的第一天，从这片{tag0}开始",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "list_intro":
             options = [
@@ -974,7 +1313,7 @@ class ScriptGenerator:
                 f"{destination}这几个地方，错过一个都可惜",
                 f"我心目中{destination}的TOP{num or 3}，你去过几个？",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         # ── 干货 / 攻略类 ──────────────────────────────────────
         if style in ("tip_numbered", "fact_numbered"):
@@ -984,7 +1323,7 @@ class ScriptGenerator:
                 f"还有第{num}个，就是这片{tag_str}，超级震撼",
                 f"第{num}个推荐：{tag0}，去过的人都说值",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "fact_surprise":
             options = [
@@ -992,7 +1331,7 @@ class ScriptGenerator:
                 f"最让我意外的是这片{tag0}，完全没想到",
                 f"说出来你可能不信，{destination}还有这样的{tag0}",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "save_for_later":
             options = [
@@ -1000,7 +1339,7 @@ class ScriptGenerator:
                 f"这篇攻略先存着，下次去{destination}直接抄作业",
                 f"收藏起来，{destination}旅行绝对用得到",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         # ── 感受 / 情绪类 ──────────────────────────────────────
         if style == "feeling":
@@ -1011,7 +1350,7 @@ class ScriptGenerator:
                 f"你有没有过那种，看到风景就想哭的瞬间",
                 f"有些风景，看一眼就记一辈子",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "personal":
             options = [
@@ -1021,7 +1360,7 @@ class ScriptGenerator:
                 f"之前总在视频里看{destination}，今天终于亲眼见到了",
                 f"我以为我不会惊讶，但看到这{tag0}还是呆住了",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "wow":
             options = [
@@ -1030,7 +1369,7 @@ class ScriptGenerator:
                 f"这就是真实存在的{tag0}吗？太不真实了",
                 f"我天，这{tag0}一眼望不到头",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "personal_wow":
             options = [
@@ -1040,7 +1379,7 @@ class ScriptGenerator:
                 f"那一刻我明白了，为什么那么多人一定要来{destination}",
                 f"相机拍不出它万分之一的美，真的",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "personal_feeling":
             options = [
@@ -1050,7 +1389,7 @@ class ScriptGenerator:
                 f"原来真的有地方，能让人瞬间平静下来",
                 f"你有没有试过，对着一片{tag0}发呆一整个下午",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "calm_reflection":
             options = [
@@ -1060,7 +1399,7 @@ class ScriptGenerator:
                 f"旅行不是为了赶路，是为了停下来看看{tag0}",
                 f"时间在这好像变慢了，挺好的",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "personal_reflection":
             options = [
@@ -1070,7 +1409,7 @@ class ScriptGenerator:
                 f"有时候觉得，人生就该多看看这样的{tag0}",
                 f"出来走走才发现，世界比想象中大得多",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "resonance":
             options = [
@@ -1079,7 +1418,7 @@ class ScriptGenerator:
                 f"那一刻突然觉得，再远都值得",
                 f"你说，人为什么总想去看看远方呢",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "activity_story":
             if tags:
@@ -1089,8 +1428,8 @@ class ScriptGenerator:
                     f"终于见到了传说中的{tag0}，名不虚传",
                     f"一路颠簸，但看到{tag_str}的瞬间，值了",
                 ]
-                return random.choice(options)
-            return "这一路的风景，真的值得"
+                return self._trim_narration(self._fix_animal_narration(random.choice(options)))
+            return self._trim_narration("这一路的风景，真的值得")
 
         if style == "food_reaction":
             options = [
@@ -1098,7 +1437,7 @@ class ScriptGenerator:
                 f"这就是{destination}的特色美食，绝了",
                 f"为了这口吃的，跑这么远都值",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         # ── 高潮 / 结尾类 ──────────────────────────────────────
         if style == "payoff":
@@ -1108,7 +1447,7 @@ class ScriptGenerator:
                 f"看到这片{tag0}的瞬间，觉得所有的奔波都值了",
                 f"这就是我梦里的{destination}，一模一样",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "climax":
             options = [
@@ -1117,7 +1456,7 @@ class ScriptGenerator:
                 f"眼前的{tag_str}，大到让人失语",
                 f"来过这里，才算真的到过{destination}",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "insight":
             options = [
@@ -1127,7 +1466,7 @@ class ScriptGenerator:
                 f"有些地方去了会后悔一阵子，但{destination}不去会后悔一辈子",
                 f"你问我旅行的意义是什么，大概就是遇见这样的{tag0}吧",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "day_end_thought":
             options = [
@@ -1136,7 +1475,7 @@ class ScriptGenerator:
                 f"又是被{destination}治愈的一天",
                 f"如果可以，真想每天都能看到这样的{tag0}",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "day_end_summary":
             options = [
@@ -1144,7 +1483,7 @@ class ScriptGenerator:
                 f"这一天，值了",
                 f"在{destination}的第一天，比想象中好太多",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "closing":
             options = [
@@ -1153,7 +1492,7 @@ class ScriptGenerator:
                 f"这趟旅程结束了，但有些东西会一直带着",
                 f"如果你也喜欢这样的{destination}，我们路上见",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "call_to_action":
             options = [
@@ -1161,7 +1500,7 @@ class ScriptGenerator:
                 f"觉得不错的话，点个赞吧，下次带你看更多{destination}的风景",
                 f"关注我，一起去看更多像{tag0}这样的风景",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         if style == "cta_relax":
             options = [
@@ -1170,7 +1509,7 @@ class ScriptGenerator:
                 f"别总忙着赶路，偶尔也停下来看看{tag0}",
                 f"找个时间出发吧，{destination}等你",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
         # 兜底：用 tag 拼一句自然的话
         if tags:
@@ -1179,9 +1518,9 @@ class ScriptGenerator:
                 f"这就是{destination}的{tag0}，名不虚传",
                 f"看到这片{tag0}，什么都值了",
             ]
-            return random.choice(options)
+            return self._trim_narration(self._fix_animal_narration(random.choice(options)))
 
-        return "这里真的太美了"
+        return self._trim_narration("这里真的太美了")
 
     def _generate_subtitle(
         self,
@@ -1191,11 +1530,11 @@ class ScriptGenerator:
         num: int | None,
         clip=None,
     ) -> str:
-        """生成字幕（优先用真实素材内容）"""
+        """生成字幕（优先用真实素材内容）。Skill 叠加：末尾统一字数裁剪 ≤8 字"""
         if clip and (clip.visual_tags or clip.scene_summary):
             result = self._generate_subtitle_from_clip(style, destination, clip, num)
             if result:
-                return result
+                return self._trim_subtitle(result)
 
         templates = self.SUBTITLE_TEMPLATES.get(style, [""])
         template = random.choice(templates) if templates else ""
@@ -1213,16 +1552,21 @@ class ScriptGenerator:
         except (KeyError, IndexError):
             text = template
 
-        return text
+        return self._trim_subtitle(text)
 
     def _generate_subtitle_from_clip(self, style: str, destination: str, clip, num: int | None) -> str:
-        """基于真实素材内容生成字幕 — 短、有共鸣、金句式"""
+        """基于真实素材内容生成字幕 — 短、有共鸣、金句式。
+
+        Skill 叠加：tag 词法修正 + 所有 return 末尾裁到 ≤8 字
+        """
         tags = clip.visual_tags or []
 
         generic_tags = {"人物", "人像", "航拍", "俯视", "当地"}
         scenic_tags = [t for t in tags if t not in generic_tags]
-        tag0 = scenic_tags[0] if scenic_tags else (tags[0] if tags else "风景")
-        tag1 = scenic_tags[1] if len(scenic_tags) > 1 else (tags[1] if len(tags) > 1 else "")
+        tag0_raw = scenic_tags[0] if scenic_tags else (tags[0] if tags else "风景")
+        tag1_raw = scenic_tags[1] if len(scenic_tags) > 1 else (tags[1] if len(tags) > 1 else "")
+        tag0 = self._fix_tag_0(tag0_raw)
+        tag1 = self._fix_tag_0(tag1_raw) if tag1_raw else ""
 
         # ── 钩子类 ──────────────────────────────────────
         if style in ("hook", "feeling"):
@@ -1233,7 +1577,7 @@ class ScriptGenerator:
                 f"{destination}的样子",
                 "来了就懂了",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         # ── 个人感受类 ──────────────────────────────────────
         if style == "personal":
@@ -1243,7 +1587,7 @@ class ScriptGenerator:
                 "终于到了",
                 "亲眼所见",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         if style in ("wow", "personal_wow"):
             options = [
@@ -1252,7 +1596,7 @@ class ScriptGenerator:
                 "亲眼见到才懂",
                 f"{tag0}名不虚传",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         if style in ("place", "scene"):
             if tag0:
@@ -1262,8 +1606,8 @@ class ScriptGenerator:
                     f"{tag0}的风",
                     f"这里是{tag0}",
                 ]
-                return random.choice(options)
-            return destination
+                return self._trim_subtitle(random.choice(options))
+            return self._trim_subtitle(destination)
 
         # ── 情感共鸣类 ──────────────────────────────────────
         if style in ("personal_feeling", "calm_reflection"):
@@ -1274,7 +1618,7 @@ class ScriptGenerator:
                 "安静且自由",
                 "风知道答案",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         if style in ("personal_reflection", "insight"):
             options = [
@@ -1284,7 +1628,7 @@ class ScriptGenerator:
                 "和自己和解了",
                 "世界比想象中大",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         # ── 高潮类 ──────────────────────────────────────
         if style in ("climax", "payoff", "emotional_peak"):
@@ -1295,7 +1639,7 @@ class ScriptGenerator:
                 f"{tag0}·一眼万年",
                 "来过就不后悔",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         # ── 结尾类 ──────────────────────────────────────
         if style in ("closing", "day_end_thought", "day_end_summary"):
@@ -1305,7 +1649,7 @@ class ScriptGenerator:
                 "带着风景离开",
                 f"再见{destination}",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         if style in ("cta", "call_to_action", "cta_relax"):
             options = [
@@ -1314,24 +1658,24 @@ class ScriptGenerator:
                 "出发永远不晚",
                 "点赞收藏",
             ]
-            return random.choice(options)
+            return self._trim_subtitle(random.choice(options))
 
         if style == "title":
-            return f"{destination}·治愈之旅"
+            return self._trim_subtitle(f"{destination}·治愈之旅")
 
         if style == "time":
-            return "新的一天"
+            return self._trim_subtitle("新的一天")
 
         # ── 攻略类兜底（保留但优化） ───────────────────────────
         if style in ("tip", "number", "tip_numbered", "fact_numbered"):
             if tag0 and num:
-                return f"第{num}站·{tag0}"
+                return self._trim_subtitle(f"第{num}站·{tag0}")
             if tag0:
-                return tag0
-            return f"第{num}个" if num else ""
+                return self._trim_subtitle(tag0)
+            return self._trim_subtitle(f"第{num}个") if num else ""
 
         if tag0:
-            return tag0
+            return self._trim_subtitle(tag0)
 
         return ""
 
@@ -1345,17 +1689,72 @@ class ScriptGenerator:
             return "dissolve" if index % 3 == 0 else "cut"
 
     def _generate_voiceover(self, scenes: list[ScriptScene], hook: Hook) -> str:
-        """生成旁白全文"""
-        parts = []
+        """生成旁白全文 — 叠加 Skill 字数预算 + 气口控制
 
+        - 按总时长×2.5字/秒×(1-10%静默) 计算字数上限
+        - 超出时先删非高潮/payoff/closing 类 scene 旁白留空做气口
+        - 每 2 句插一次 "——" 停顿标记（TTS 会按破折号停顿）
+        """
+        total_duration = 0.0
+        if scenes:
+            for s in scenes:
+                total_duration += s.duration_sec
+            if total_duration < 10:
+                total_duration = 30.0
+
+        max_chars = int(total_duration * self.storytelling_skill["narration_chars_per_sec"]
+                         * (1 - self.storytelling_skill["narration_silent_ratio"] * 0.5))
+        max_chars = max(40, max_chars)
+
+        parts: list[str] = []
         if hook.text:
             parts.append(hook.text)
+        char_count = sum(len(p) for p in parts)
 
-        for scene in scenes:
-            if scene.narration and scene.narration != hook.text:
-                parts.append(scene.narration)
+        # scene 保留优先级：高潮 payoff/climax/closing > 其余
+        def priority(s: ScriptScene) -> int:
+            if s.mood in ("triumph", "awe", "shock"):
+                return 0
+            if (s.clip_description or "") in ("payoff", "climax", "closing",
+                                               "emotional_peak", "resonance"):
+                return 0
+            return 1
 
-        return "。".join(parts) + "。"
+        order = sorted(range(len(scenes)), key=lambda i: (priority(scenes[i]), i))
+        included: set[int] = set()
+        for i in order:
+            s = scenes[i]
+            if not s.narration or s.narration == hook.text:
+                continue
+            if char_count + len(s.narration) > max_chars and priority(s) > 0:
+                if char_count + len(s.narration) > int(max_chars * 1.2):
+                    continue
+            parts.append(s.narration)
+            char_count += len(s.narration)
+            included.add(i)
+
+        # 未包含的 scene.narration 置空，剪辑阶段留气口 / 纯画面
+        for i, s in enumerate(scenes):
+            if i not in included:
+                s.narration = ""
+
+        text = "。".join([p for p in parts if p])
+        if text:
+            text += "。"
+
+        # 每两句一次 "——" 气口停顿
+        sentences: list[str] = []
+        if "。" in text:
+            sentences = [s for s in text.split("。") if s]
+            merged: list[str] = []
+            for j, s in enumerate(sentences):
+                merged.append(s)
+                if (j + 1) % 2 == 0 and j < len(sentences) - 1:
+                    merged.append("——")
+            text = "。".join(merged)
+
+        logger.info(f"旁白全文 {len(sentences)} 句 / {char_count} 字 / 时长 {total_duration:.1f}s (上限 {max_chars} 字)")
+        return text
 
     def generate_short(
         self,

@@ -27,15 +27,30 @@ class StoryboardPlanner:
         self,
         script: Script | dict[str, Any],
         candidate_clips: CandidateClips | dict[str, Any],
+        style: str = "",
+        **kwargs: Any,
     ) -> list[dict[str, Any]]:
         """将剧本拆解为分镜表
+
+        Args:
+            script: 剧本
+            candidate_clips: 候选素材
+            style: 风格标识（humor/real/contrast），用于后续扩展选景偏好
+                - contrast: 未来可扩展为优先选强对比类别配对（雪山/花海, 城市/自然）
+                - humor: 未来可扩展选滑稽/拟人感的素材
+                - real: 优先稳定清晰镜头
+            **kwargs: 吸收 YAML 注入的其他扩展参数，防止 future 兼容性报错
 
         Returns:
             分镜列表，每个分镜包含：
             - script_scene: 剧本中的分镜信息
             - matched_clip: 匹配的素材片段
         """
-        logger.info("开始分镜规划")
+        logger.info(
+            f"开始分镜规划" + (f", 风格={style}" if style else "")
+        )
+        if style:
+            logger.debug(f"当前风格选景策略占位（后续可细化）: style={style}")
 
         script_scenes = self._extract_script_scenes(script)
         clips = self._extract_clips(candidate_clips)

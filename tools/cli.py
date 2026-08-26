@@ -184,23 +184,115 @@ def retrieve(query: str, destination: str | None, top_k: int, output: str | None
 @click.argument("pipeline_name")
 @click.option("--destination", "-d", default=None, help="目的地")
 @click.option("--duration", "-t", type=int, default=None, help="目标时长（秒）")
+@click.option(
+    "--styles",
+    "-s",
+    multiple=True,
+    default=None,
+    help="风格列表（可多次传），可选 humor/real/contrast。例：-s humor -s real -s contrast；不传则默认 3 种都生成",
+)
 @click.option("--dry-run", is_flag=True, help="只打印计划不执行")
-def run(pipeline_name: str, destination: str | None, duration: int | None, dry_run: bool):
-    """运行流水线"""
+def run(
+    pipeline_name: str,
+    destination: str | None,
+    duration: int | None,
+    styles: tuple[str, ...] | None,
+    dry_run: bool,
+):
+    """运行流水线（支持同素材一次生成多风格：humor / real / contrast）
+
+    示例：
+      tam run travel-vlog -d 新疆                  # 3 种风格各一条
+      tam run travel-vlog -d 新疆 -s humor -s real  # 只生成幽默+活人感
+      tam run travel-vlog -d 新疆 -s ""            # 禁用多风格循环，走原单条逻辑
+    """
+    from tools.common.style_registry import (
+        DEFAULT_STYLE_ORDER,
+        STYLES,
+        StyleProfile,
+        get_style,
+    )
+
     pipeline_file = PIPELINE_DEFS_DIR / f"{pipeline_name}.yaml"
     if not pipeline_file.exists():
         console.print(f"[red]✗ 流水线不存在: {pipeline_name}[/]")
-        console.print(f"  可用流水线: {', '.join(p.stem for p in PIPELINE_DEFS_DIR.glob('*.yaml'))}")
+        console.print(
+            f"  可用流水线: {', '.join(p.stem for p in PIPELINE_DEFS_DIR.glob('*.yaml'))}"
+        )
         sys.exit(1)
 
-    variables = {}
-    if destination:
-        variables["destination"] = destination
-    if duration:
-        variables["duration"] = duration
+    # 解析 --styles
+    # Click multiple=True 默认返回空 tuple ()，不是 None
+    styles_list: list[StyleProfile] = []
+    if not styles:
+        # 不传 --styles → 默认三种
+        styles_list = [get_style(s) for s in DEFAULT_STYLE_ORDER]
+    else:
+        for s in styles:
+            if not s:
+                # 用户显式传了空字符串（-s ""）→ 禁用多风格，保持原单条行为
+                styles_list = []
+                break
+            styles_list.append(get_style(s))
 
-    runner = PipelineRunner()
-    runner.run(pipeline_name, variables=variables, dry_run=dry_run)
+    base_vars: dict = {}
+    if destination:
+        base_vars["destination"] = destination
+    if duration:
+        base_vars["duration"] = int(duration)  # 确保是 int
+
+    # ── 无风格循环（保持原行为） ──
+    if not styles_list:
+        runner = PipelineRunner()
+        runner.run(pipeline_name, variables=dict(base_vars), dry_run=dry_run)
+        return
+
+    # ── 多风格循环 ──
+    summary_rows: list[tuple[str, str]] = []
+    for idx, prof in enumerate(styles_list, 1):
+        console.print(f"\n\n[bold magenta]══════════════════════════════════════════════════[/]")
+        console.print(
+            f"[bold magenta]▌ 风格 {idx}/{len(styles_list)}: {prof.label}（{prof.name}）[/]"
+        )
+        console.print(f"[bold magenta]══════════════════════════════════════════════════[/]")
+
+        style_vars = dict(base_vars)
+        style_vars["style"] = prof.name
+        style_vars["style_label"] = prof.label
+        style_vars["persona"] = prof.persona
+        style_vars["narrative"] = prof.narrative
+        # 禁用词拼成逗号分隔字符串，YAML 里再拆
+        style_vars["avoid_words"] = "，".join(prof.avoid_words) if prof.avoid_words else ""
+        style_vars["hook_priority"] = ",".join(prof.hook_priority)
+        style_vars["device_priority"] = ",".join(prof.device_priority)
+        # TTS：不同风格用不同音色/语速
+        style_vars["tts_voice"] = prof.tts_voice
+        style_vars["tts_rate"] = prof.tts_rate
+        # 前缀：区分输出文件 — final_新疆_humor.mp4 / edit_decision_copy_humor.json ...
+        style_vars["run_prefix"] = f"_{prof.name}"
+        # 风格子文件夹：配音互不覆盖
+        style_vars["vo_suffix"] = prof.name
+
+        try:
+            runner = PipelineRunner()
+            runner.run(pipeline_name, variables=style_vars, dry_run=dry_run)
+            summary_rows.append((prof.label, "✅"))
+        except Exception as e:
+            console.print(f"  [red]✗ 风格 {prof.label} 失败: {e}[/]")
+            summary_rows.append((prof.label, f"❌ {e}"))
+
+    # 多风格汇总表
+    console.print("\n")
+    table = Table(title="多风格生成汇总", show_header=True)
+    table.add_column("风格", style="cyan")
+    table.add_column("结果", style="green")
+    for label, status in summary_rows:
+        table.add_row(label, status)
+    console.print(table)
+    console.print(
+        f"\n[green]完成: 共 {len(styles_list)} 条风格视频 → {OUTPUT_DIR}/"
+        f"final_{{destination}}_{{style}}.mp4[/]"
+    )
 
 
 @cli.command()

@@ -187,18 +187,11 @@ class EditDecisionMaker:
         """为片段建议特效"""
         effects = []
 
-        # 检查是否为静态画面（需要 Ken Burns 效果避免幻灯片风险）
-        motion_tags = clip.get("motion_tags", [])
-        visual_tags = clip.get("visual_tags", [])
-
-        is_static = any("静态" in tag for tag in motion_tags) or not motion_tags
-        is_landscape = any("风景" in tag or "全景" in tag or "航拍" in tag for tag in visual_tags)
-
-        if is_static and is_landscape:
-            effects.append({
-                "type": "ken_burns",
-                "intensity": 0.3,
-            })
+        # 所有镜头强制加 Ken Burns，避免幻灯片风险
+        effects.append({
+            "type": "ken_burns",
+            "intensity": 0.3,
+        })
 
         # 高潮段加 vignette
         mood = storyboard_item.get("script_scene", {})
@@ -213,11 +206,11 @@ class EditDecisionMaker:
         return effects
 
     def _default_subtitle_style(self) -> dict[str, Any]:
-        """默认字幕样式"""
+        """默认字幕样式（横屏 1080p 基准 font_size；4K scale=2 → 约 165px 实际渲染）"""
         return {
-            "font_size": 48,
+            "font_size": 72,
             "position": "bottom",
             "color": "#FFFFFF",
             "stroke": "#000000",
-            "stroke_width": 2,
+            "stroke_width": 4,
         }

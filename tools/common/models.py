@@ -148,6 +148,7 @@ class CandidateClip(BaseModel):
     score: float
     scene_summary: str = ""
     visual_tags: list[str] = Field(default_factory=list)
+    subjects: list[str] = Field(default_factory=list)
     scene_category: str = "other"
     quality: float = 0.0
 
@@ -205,6 +206,8 @@ class Script(BaseModel):
     voiceover: str = ""
     scenes: list[ScriptScene] = Field(default_factory=list)
     cta: str = ""
+    # 风格标识：humor(幽默吐槽) / real(活人感真实) / contrast(有反差对比)
+    style: str = ""
 
 
 class TimelineItem(BaseModel):
@@ -217,13 +220,15 @@ class TimelineItem(BaseModel):
     duration_sec: float
     transition_in: str = "cut"
     transition_duration: float = 0.5
+    # 顶部左上角竖排金句（错位手法创意文案，如"天空是今天的主角"）
+    top_subtitle: str = ""
+    # 底部配音字幕（配音内容，方便观众跟读）
+    bottom_subtitle: str = ""
+    # 兼容旧字段：= top_subtitle（上一轮的 subtitle 概念是金句）
     subtitle: str = ""
     subtitle_style: dict[str, Any] = Field(default_factory=dict)
     effects: list[dict[str, Any]] = Field(default_factory=list)
     narration_text: str = ""
-    # ── 供 copywriting stage 使用的画面原料 ──
-    # 错位手法（skills/travel-copywriting.md §2 手法A）需要画面里的具体物件做抓手。
-    # "湖泊"抓不出手法，"没化完的浮冰"才能抓出"冰敷"。
     visual_summary: str = ""
     visual_tags: list[str] = Field(default_factory=list)
 
@@ -238,6 +243,13 @@ class BgmConfig(BaseModel):
 class VoiceoverConfig(BaseModel):
     path: str = ""
     volume: float = 1.0
+    # 整条配音的总时长（TTS 原声未拉伸，秒）
+    duration: float = 0.0
+    # 每段镜头配音的原声时长（仅 scene 旁白段，不含 hook/cta）
+    scene_durations: list[float] = Field(default_factory=list)
+    # 所有配音段的完整分段元数据（含 hook/scene/cta）
+    # [{ "kind": "hook"|"scene"|"cta", "text": str, "duration_sec": float, "path": str }, ...]
+    segments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OutputFormat(BaseModel):
@@ -286,7 +298,9 @@ class CreativeBrief(BaseModel):
     destination: str = ""
     # ★ 创作者提供的真实行程背景，1-3 句。没有它文案必然退化成套话
     trip_context: str = ""
-    # 口吻：克制 / 文艺 / 沙雕 / 干货 / 知心朋友
+    # 风格标识：humor / real / contrast
+    style: str = ""
+    # 口吻：克制 / 幽默吐槽 / 沙雕 / 干货 / 知心朋友
     persona: str = "克制、不煽情、像跟朋友讲事"
     audience: str = ""
     # 禁用词，会与 skill 里的禁用清单合并

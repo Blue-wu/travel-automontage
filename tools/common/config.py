@@ -37,7 +37,7 @@ class DashScopeConfig:
     """阿里云 DashScope (通义千问) 配置"""
     api_key: str = field(default_factory=lambda: os.getenv("DASHSCOPE_API_KEY", ""))
     # 视频理解模型（通用大模型，支持视频输入）
-    vl_model: str = "qwen3.8-max"
+    vl_model: str = "qwen-max"
     # 多模态向量模型（文本+图片+视频统一空间）
     embedding_model: str = "qwen3-vl-embedding"
     # embedding 维度

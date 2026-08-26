@@ -103,18 +103,23 @@ class PipelineRunner:
                 output = self._run_stage(stage)
                 self.stage_outputs[stage_name] = output
                 # 同时用 output 文件名（去掉后缀）作为 key，方便 YAML 中引用
-                output_file = stage.get("output", "")
-                if output_file:
+                # ★ 关键：必须先解析变量，把 "script{{run_prefix}}.json" → "script_humor.json"
+                #    否则别名 key 是 "script{{run_prefix}}"，下游找不到 "script_humor"
+                output_file_raw = stage.get("output", "")
+                if output_file_raw:
+                    output_file = self._resolve_string(output_file_raw) if isinstance(output_file_raw, str) else output_file_raw
                     output_key = Path(output_file).stem
                     self.stage_outputs[output_key] = output
+                    logger.debug(f"已存 stage 别名: {output_key} → {type(output).__name__}")
                 console.print(f"  [green]✓ {stage_name} 完成[/]")
             except Exception as e:
                 on_failure = stage.get("on_failure", "fatal")
                 if on_failure == "warn":
                     console.print(f"  [yellow]⚠ {stage_name} 失败（warn）: {e}[/]")
                     self.stage_outputs[stage_name] = None
-                    output_file = stage.get("output", "")
-                    if output_file:
+                    output_file_raw = stage.get("output", "")
+                    if output_file_raw:
+                        output_file = self._resolve_string(output_file_raw) if isinstance(output_file_raw, str) else output_file_raw
                         output_key = Path(output_file).stem
                         self.stage_outputs[output_key] = None
                 elif on_failure == "retry":
@@ -124,8 +129,9 @@ class PipelineRunner:
                     console.print(f"  [red]✗ {stage_name} 失败，重试 {max_attempts} 次（回到 {back_to}）[/]")
                     # 简化：仅记录失败
                     self.stage_outputs[stage_name] = None
-                    output_file = stage.get("output", "")
-                    if output_file:
+                    output_file_raw = stage.get("output", "")
+                    if output_file_raw:
+                        output_file = self._resolve_string(output_file_raw) if isinstance(output_file_raw, str) else output_file_raw
                         output_key = Path(output_file).stem
                         self.stage_outputs[output_key] = None
                 else:  # fatal
@@ -156,10 +162,17 @@ class PipelineRunner:
         result = tool(**input_data) if input_data else tool()
 
         # 如果有输出路径，保存到文件
-        output_file = stage.get("output")
-        if output_file and result is not None:
+        # ★ 必须先解析变量（替换 {{run_prefix}} 等），否则多风格循环会写同一路径互相覆盖
+        output_file_raw = stage.get("output")
+        if output_file_raw and result is not None:
+            output_file = (
+                self._resolve_string(output_file_raw)
+                if isinstance(output_file_raw, str)
+                else output_file_raw
+            )
             output_path = OUTPUT_DIR / output_file
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"保存 stage 输出文件: {output_path}")
             self._save_output(result, output_path)
 
         return result
@@ -218,21 +231,40 @@ class PipelineRunner:
             return data
 
     def _resolve_string(self, s: str) -> Any:
-        """替换单个字符串中的变量"""
-        # 处理 {{variable}} 或 {{stage_output.field}}
-        pattern = r"\{\{([^}]+)\}\}"
+        """替换单个字符串中的变量（支持嵌套：{{trend_report{{run_prefix}}}}）
 
-        def replacer(match):
-            expr = match.group(1).strip()
-            return str(self._eval_expr(expr))
+        执行流程：
+        1. 先把字符串里的「内层 {{...}}」替换掉（比如先把 {{run_prefix}} 换成 _humor）
+        2. 替换后的字符串可能还剩一层或多层，重复这个过程直到没有可替换项
+           （最多 5 轮，防止死循环）
+        3. 若最终字符串整个是一个「顶层变量引用」（如 "trend_report_humor"），
+           再用 _eval_expr 返回对象本身（用于 YAML 中 input 引用 stage 输出）
+        """
+        pattern = r"\{\{([^{}]+)\}\}"  # 必须最内层优先（中间不含 { 或 }）
+        result = s
+        last = None
+        for _ in range(5):
+            if last == result:
+                break
+            last = result
 
-        result = re.sub(pattern, replacer, s)
+            def replacer(match, _result_local=result):
+                expr = match.group(1).strip()
+                return str(self._eval_expr(expr))
 
-        # 如果整个字符串就是一个变量引用，尝试返回原始类型
-        full_match = re.fullmatch(r"\{\{([^}]+)\}\}", s.strip())
+            result = re.sub(pattern, replacer, result)
+
+        # 如果最终整个字符串就是一个"单一顶层变量引用"（没有内嵌其他字符），
+        # 尝试返回原始类型（比如 stage 输出对象 / int / bool / Pydantic 模型等），否则保持字符串
+        full_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_\-]*)", result.strip())
         if full_match:
-            return self._eval_expr(full_match.group(1).strip())
-
+            candidate = full_match.group(1)
+            val = self._eval_expr(candidate)
+            # _eval_expr 找不到时会返回占位符字符串 "{{candidate}}"
+            # 只要不是占位符字符串，说明解析成功 → 直接返回原始类型（包含 Pydantic 模型）
+            not_found_sentinel = f"{{{{{candidate}}}}}"
+            if not (isinstance(val, str) and val == not_found_sentinel):
+                return val
         return result
 
     def _eval_expr(self, expr: str) -> Any:

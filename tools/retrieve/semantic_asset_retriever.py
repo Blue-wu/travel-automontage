@@ -461,8 +461,8 @@ class SemanticAssetRetriever:
                         "score": score,
                         "scene_summary": scene.summary,
                         "visual_tags": scene.visual_tags,
-                    "subjects": list(getattr(scene, "subjects", None) or []),
                         "subjects": list(getattr(scene, "subjects", None) or []),
+                        "scene_category": scene.scene_category,
                         "quality": scene.quality,
                     })
 
