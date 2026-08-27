@@ -649,6 +649,10 @@ class SemanticAssetRetriever:
         by_duration = total_duration * essence_ratio
 
         estimated = min(by_count, by_duration)
-        estimated = max(15.0, min(60.0, estimated))
 
-        return round(estimated, 1)
+        # ⚠️ 这里原来是 estimated = max(15.0, min(60.0, estimated))
+        # 一整天 30 分钟素材算出来该做 6 分钟，被这一行砍成 40 多秒，
+        # 每个地点只分到 2-3 秒 —— 蜻蜓点水，既没故事也没连贯。
+        # 时长应由体裁决定（tools/edit/chapter_planner.FORMATS），不由 clamp 决定。
+        # 这里只保留一个防御性下限，上限交给调用方。
+        return round(max(8.0, estimated), 1)
