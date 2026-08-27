@@ -174,6 +174,9 @@ def build_timeline(
                 transition_in="fade" if idx == 0 else "cut",
                 transition_duration=0.4 if idx == 0 else 0.0,
                 subtitle=subtitle,
+                # 合并后 composer 读的是 top_subtitle（双时间轴的视觉层），
+                # subtitle 仅作旧字段兼容 —— 两个都写，避免章节标题渲染不出来
+                top_subtitle=subtitle,
                 narration_text="",
                 visual_summary=s.get("summary", "") or "",
                 visual_tags=list(s.get("subjects") or s.get("visual_tags") or []),

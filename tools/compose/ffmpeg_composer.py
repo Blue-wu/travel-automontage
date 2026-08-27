@@ -459,14 +459,19 @@ class FFmpegComposer:
 
         基准分辨率：横屏 1920x1080 基准，4K 下 scale=2
         """
-        base_w, base_h = 1920, 1080  # 横屏 1080p 基准（4K 时 scale=2）
+        # ⚠️ 原来是 base_w, base_h = 1920, 1080（横屏基准），但输出是竖屏
+        # 1080x1920，于是 scale = play_h / base_h = 1920/1080 = 1.78 ——
+        # 拿竖屏的高去除横屏的高没有意义，字号被整体放大 1.78 倍，
+        # 底部字幕 147px 在 1080 宽画面上一行只放得下 7 个字。
+        # 字幕大小该按【画面宽度】衡量（可读性取决于占宽比），基准 1080 宽。
+        base_w, base_h = 1080, 1920
 
         if output_format and output_format.width > 0 and output_format.height > 0:
             play_w, play_h = output_format.width, output_format.height
         else:
             play_w, play_h = base_w, base_h
 
-        scale = play_h / base_h
+        scale = play_w / base_w      # 按宽度缩放：1080→1.0，4K竖屏 2160→2.0
 
         # ═══════════════════════════════════════════════════════════
         # 准备 Bottom 字幕的「配音节奏真源」：
